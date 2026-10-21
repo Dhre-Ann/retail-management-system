@@ -51,6 +51,23 @@ For card purchases, the system is designed to validate the available account bal
 
 All account information and transactions used for testing are simulated. No real banking information is required.
 
+## Front-end UI draft
+
+The screens in this repo are a front-end-only draft. Double-click `home.html` to open it in Chrome, Firefox, or Safari. An internet connection is required so the Tailwind CSS file can load from the CDN. There is no build step and no server yet.
+
+| File | Role |
+|---|---|
+| `home.html` | Layout: header, four sections, SQL log, toasts, confirmation modal |
+| `js/api.js` | Mock backend. The only file to edit when the real server is ready. |
+| `js/app.js` | Navigation, validation, and button wiring |
+| `js/ui.js` | Tables, toasts, the confirmation modal, and the SQL log |
+
+Every button that would talk to the database calls a function in `js/api.js`. Each stub returns `{ data, sql, ms }` after a short delay. The SQL text is shown in the panel labeled "SQL Sent to Server".
+
+The header **Demo Video** link is a placeholder (`https://example.com/freshmart-team16-demo`). Replace that `href` in `home.html` when the video is published. The **README** link points at this file.
+
+Bank accounts and payments in the draft are simulated.
+
 ## Getting Started
 
 Setup instructions will be added as the application and database implementation are completed.
