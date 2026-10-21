@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FreshMart Chain</title>
+  <!-- Tailwind via CDN. Open this file directly in a browser. Internet is required for the styles. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :focus-visible {
+      outline: 2px solid #047857;
+      outline-offset: 2px;
+    }
+    /* Room for the fixed SQL panel. ui.js updates this value when the panel opens or closes. */
+    #app-shell {
+      padding-bottom: var(--sql-space, 12rem);
+    }
+    /* Keep focused controls above the fixed SQL panel when the browser scrolls them into view. */
+    #app-shell :is(button, input, select, textarea, a) {
+      scroll-margin-bottom: calc(var(--sql-space, 12rem) + 12px);
+    }
+    /* Grid items default to min-width:auto, which lets a wide table stretch the page. */
+    #main .grid > *,
+    #main .overflow-x-auto {
+      min-width: 0;
+      max-width: 100%;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <a href="#main" class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:bg-white focus:px-3 focus:py-2 focus:rounded-md">Skip to content</a>
+
+  <header class="bg-white border-b border-slate-200">
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
+      <h1 class="text-lg font-semibold text-emerald-800 mr-auto">FreshMart Chain</h1>
+      <button type="button" id="stop-btn" class="min-h-11 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50" title="Cancel the running simulation">
+        Stop
+      </button>
+      <a class="text-sm font-medium text-emerald-800 underline decoration-emerald-300 underline-offset-2 hover:decoration-emerald-700" href="README.md">README</a>
+      <a class="text-sm font-medium text-emerald-800 underline decoration-emerald-300 underline-offset-2 hover:decoration-emerald-700" href="https://example.com/freshmart-team16-demo" title="Placeholder — replace with the real demo video URL">Demo Video</a>
+      <span class="text-xs font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-1">Team 16</span>
+    </div>
+  </header>
+
+  <div id="app-shell" class="md:flex md:items-start">
+    <nav aria-label="Sections" class="bg-white border-b md:border-b-0 md:border-r border-slate-200 md:w-56 md:min-h-[calc(100vh-3.5rem)] md:sticky md:top-0 flex md:flex-col gap-1 overflow-x-auto p-2">
+      <button type="button" class="nav-btn shrink-0 text-left rounded-md border-l-4 px-3 py-2 text-sm font-medium min-h-11" data-section="front-desk">Front Desk</button>
+      <button type="button" class="nav-btn shrink-0 text-left rounded-md border-l-4 px-3 py-2 text-sm font-medium min-h-11" data-section="back-office">Back Office</button>
+      <button type="button" class="nav-btn shrink-0 text-left rounded-md border-l-4 px-3 py-2 text-sm font-medium min-h-11" data-section="simulation">Simulation</button>
+      <button type="button" class="nav-btn shrink-0 text-left rounded-md border-l-4 px-3 py-2 text-sm font-medium min-h-11" data-section="admin">Admin / Database Tools</button>
+    </nav>
+
+    <main id="main" class="flex-1 min-w-0 p-4 md:p-6">
+
+      <!-- ========== Front Desk ========== -->
+      <section id="section-front-desk" aria-labelledby="front-desk-heading">
+        <h2 id="front-desk-heading" class="text-xl font-semibold text-slate-900">Front Desk</h2>
+        <p class="mt-1 text-sm text-slate-600">Cash register. Prices and tax depend on the store's state. Nothing is saved until Checkout.</p>
+
+        <div class="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(18rem,0.8fr)]">
+          <div class="space-y-4">
+            <div class="bg-white border border-slate-200 rounded-lg p-4">
+              <label for="store-select" class="block text-sm font-medium text-slate-700 mb-1">Store</label>
+              <select id="store-select" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm min-h-11">
+                <option value="">Loading stores…</option>
+              </select>
+              <p id="store-meta" class="mt-2 text-sm text-slate-600"></p>
+            </div>
+
+            <form id="add-form" class="bg-white border border-slate-200 rounded-lg p-4 space-y-3" novalidate>
+              <h3 class="text-sm font-semibold text-slate-800">Add an item</h3>
+              <div>
+                <label for="product-search" class="block text-sm font-medium text-slate-700 mb-1">Search by SKU or name</label>
+                <input id="product-search" type="search" autocomplete="off" placeholder="e.g. milk or MLK-101" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+              </div>
+              <div>
+                <label for="product-select" class="block text-sm font-medium text-slate-700 mb-1">Product</label>
+                <select id="product-select" size="5" class="w-full rounded-md border border-slate-300 bg-white px-2 py-1 text-sm"></select>
+              </div>
+              <p id="product-meta" class="text-sm text-slate-600"></p>
+
+              <div id="qty-field">
+                <label for="qty-input" class="block text-sm font-medium text-slate-700 mb-1">Quantity</label>
+                <input id="qty-input" type="number" inputmode="numeric" min="1" step="1" value="1" class="w-full max-w-[10rem] rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+              </div>
+              <div id="weight-field" class="hidden">
+                <label for="weight-input" class="block text-sm font-medium text-slate-700 mb-1">Weight (lb)</label>
+                <input id="weight-input" type="number" inputmode="decimal" min="0.01" step="0.01" value="1.00" class="w-full max-w-[10rem] rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+              </div>
+
+              <p id="add-error" class="hidden text-sm text-red-700" role="alert"></p>
+
+              <div class="flex flex-wrap gap-2">
+                <button type="submit" class="min-h-11 rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800">Add to cart</button>
+                <button type="button" id="random-items-btn" class="min-h-11 rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50">Add 10–20 random items</button>
+              </div>
+            </form>
+
+            <div class="bg-white border border-slate-200 rounded-lg p-4">
+              <div class="flex items-center justify-between gap-2 mb-2">
+                <h3 class="text-sm font-semibold text-slate-800">Cart</h3>
+                <button type="button" id="clear-cart-btn" class="text-sm font-medium text-slate-600 underline decoration-slate-300 underline-offset-2">Clear cart</button>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="min-w-[40rem] w-full text-sm">
+                  <thead class="bg-slate-50 text-left text-slate-600">
+                    <tr>
+                      <th scope="col" class="px-2 py-2 font-medium">Line</th>
+                      <th scope="col" class="px-2 py-2 font-medium">SKU</th>
+                      <th scope="col" class="px-2 py-2 font-medium">Name</th>
+                      <th scope="col" class="px-2 py-2 font-medium">Qty / weight</th>
+                      <th scope="col" class="px-2 py-2 font-medium text-right">Unit price</th>
+                      <th scope="col" class="px-2 py-2 font-medium text-right">Line total</th>
+                      <th scope="col" class="px-2 py-2 font-medium"><span class="sr-only">Remove</span></th>
+                    </tr>
+                  </thead>
+                  <tbody id="cart-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="space-y-4">
+            <div class="bg-white border border-slate-200 rounded-lg p-4" aria-live="polite">
+              <h3 class="text-sm font-semibold text-slate-800">Totals</h3>
+              <dl id="totals-panel" class="mt-3 space-y-2 text-sm"></dl>
+            </div>
+
+            <form id="pay-form" class="bg-white border border-slate-200 rounded-lg p-4 space-y-3" novalidate>
+              <h3 class="text-sm font-semibold text-slate-800">Payment</h3>
+              <fieldset>
+                <legend class="text-sm font-medium text-slate-700 mb-1">Method</legend>
+                <div class="flex flex-wrap gap-4">
+                  <label class="inline-flex items-center gap-2 text-sm min-h-11">
+                    <input type="radio" name="pay-method" id="pay-cash" value="cash" checked>
+                    Cash
+                  </label>
+                  <label class="inline-flex items-center gap-2 text-sm min-h-11">
+                    <input type="radio" name="pay-method" id="pay-card" value="card">
+                    Card
+                  </label>
+                </div>
+              </fieldset>
+
+              <div id="account-field" class="hidden space-y-2">
+                <label for="account-select" class="block text-sm font-medium text-slate-700">Bank account</label>
+                <select id="account-select" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm min-h-11">
+                  <option value="">Choose an account</option>
+                </select>
+                <p id="account-balance" class="text-sm text-slate-600"></p>
+                <p id="account-warning" class="hidden text-sm text-red-700"></p>
+              </div>
+
+              <p id="checkout-error" class="hidden text-sm text-red-700" role="alert"></p>
+              <button type="submit" id="checkout-btn" class="w-full min-h-11 rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800">Checkout</button>
+            </form>
+
+            <article id="receipt-view" class="hidden bg-white border border-slate-200 rounded-lg p-4" aria-live="polite"></article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========== Back Office ========== -->
+      <section id="section-back-office" class="hidden" aria-labelledby="back-office-heading">
+        <h2 id="back-office-heading" class="text-xl font-semibold text-slate-900">Back Office</h2>
+        <p class="mt-1 text-sm text-slate-600">Reports for store managers. Pick a report, set its filters, then run it.</p>
+
+        <div id="report-list" class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          <button type="button" data-report="sales-by-store" class="report-card text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-emerald-400">
+            <span class="block text-sm font-semibold">Sales total per store</span>
+            <span class="mt-1 block text-sm text-slate-600">Receipt totals for each store in a date range.</span>
+          </button>
+          <button type="button" data-report="sales-by-state" class="report-card text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-emerald-400">
+            <span class="block text-sm font-semibold">Sales total per state</span>
+            <span class="mt-1 block text-sm text-slate-600">Receipt totals rolled up by store state.</span>
+          </button>
+          <button type="button" data-report="top-products" class="report-card text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-emerald-400">
+            <span class="block text-sm font-semibold">Top-selling products</span>
+            <span class="mt-1 block text-sm text-slate-600">Products ranked by pre-tax line sales.</span>
+          </button>
+          <button type="button" data-report="low-stock" class="report-card text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-emerald-400">
+            <span class="block text-sm font-semibold">Low-stock items per store</span>
+            <span class="mt-1 block text-sm text-slate-600">Inventory at or under a quantity you choose.</span>
+          </button>
+          <button type="button" data-report="tax-by-state" class="report-card text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-emerald-400">
+            <span class="block text-sm font-semibold">Tax collected per state</span>
+            <span class="mt-1 block text-sm text-slate-600">Taxable sales and tax, grouped by state.</span>
+          </button>
+          <button type="button" data-report="payments-by-method" class="report-card text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-emerald-400">
+            <span class="block text-sm font-semibold">Payments by method</span>
+            <span class="mt-1 block text-sm text-slate-600">Cash vs card, and approved vs declined counts.</span>
+          </button>
+          <button type="button" data-report="receipt-lookup" class="report-card text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-emerald-400">
+            <span class="block text-sm font-semibold">Receipt lookup</span>
+            <span class="mt-1 block text-sm text-slate-600">One receipt and its line items, by receipt ID.</span>
+          </button>
+        </div>
+
+        <form id="report-form" class="mt-4 bg-white border border-slate-200 rounded-lg p-4 space-y-3" novalidate>
+          <p id="report-prompt" class="text-sm text-slate-600">Choose a report above.</p>
+
+          <div id="params-dates" class="hidden flex flex-wrap gap-3">
+            <div>
+              <label for="report-start" class="block text-sm font-medium text-slate-700 mb-1">Start date</label>
+              <input id="report-start" type="date" class="rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+            </div>
+            <div>
+              <label for="report-end" class="block text-sm font-medium text-slate-700 mb-1">End date</label>
+              <input id="report-end" type="date" class="rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+            </div>
+          </div>
+
+          <div id="params-threshold" class="hidden">
+            <label for="report-threshold" class="block text-sm font-medium text-slate-700 mb-1">Low-stock threshold</label>
+            <input id="report-threshold" type="number" min="0" step="1" value="10" class="w-full max-w-[10rem] rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+            <p class="mt-1 text-sm text-slate-500">Show items whose available quantity is this number or less. Weight items use pounds.</p>
+          </div>
+
+          <div id="params-receipt" class="hidden">
+            <label for="report-receipt-id" class="block text-sm font-medium text-slate-700 mb-1">Receipt ID</label>
+            <input id="report-receipt-id" type="number" min="1" step="1" class="w-full max-w-[12rem] rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+          </div>
+
+          <p id="report-error" class="hidden text-sm text-red-700" role="alert"></p>
+
+          <div class="flex flex-wrap gap-2">
+            <button type="submit" id="run-report-btn" class="min-h-11 rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800">Run report</button>
+            <button type="button" id="export-csv-btn" class="min-h-11 rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50" disabled>Export to CSV</button>
+          </div>
+        </form>
+
+        <div class="mt-4">
+          <p id="report-meta" class="text-sm text-slate-600 mb-2"></p>
+          <div id="receipt-detail" class="hidden mb-4"></div>
+          <div id="report-table" data-table></div>
+        </div>
+      </section>
+
+      <!-- ========== Simulation ========== -->
+      <section id="section-simulation" class="hidden" aria-labelledby="simulation-heading">
+        <h2 id="simulation-heading" class="text-xl font-semibold text-slate-900">Simulation</h2>
+        <p class="mt-1 text-sm text-slate-600">Generate many checkouts at once. Stop, in the header, cancels the run. Finished checkouts stay in the mock database.</p>
+
+        <form id="sim-form" class="mt-4 bg-white border border-slate-200 rounded-lg p-4 space-y-3" novalidate>
+          <div class="grid gap-3 sm:grid-cols-3">
+            <div>
+              <label for="sim-customers" class="block text-sm font-medium text-slate-700 mb-1">Customers / receipts</label>
+              <input id="sim-customers" type="number" min="1" max="1000" step="1" value="100" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+            </div>
+            <div>
+              <label for="sim-stores" class="block text-sm font-medium text-slate-700 mb-1">Stores involved</label>
+              <input id="sim-stores" type="number" min="1" max="5" step="1" value="3" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+            </div>
+            <div>
+              <label for="sim-concurrency" class="block text-sm font-medium text-slate-700 mb-1">Concurrent connections</label>
+              <input id="sim-concurrency" type="number" min="1" max="20" step="1" value="5" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+            </div>
+          </div>
+          <p class="text-sm text-slate-500">Concurrent connections is how many checkouts run at the same time. It stands in for a pool of database connections.</p>
+          <p id="sim-error" class="hidden text-sm text-red-700" role="alert"></p>
+          <button type="submit" id="sim-run-btn" class="min-h-11 rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800">Run Simulation</button>
+        </form>
+
+        <div class="mt-4 bg-white border border-slate-200 rounded-lg p-4 space-y-3" aria-live="polite">
+          <div>
+            <div class="flex justify-between text-sm text-slate-600 mb-1">
+              <span id="sim-progress-label">Waiting to start</span>
+              <span id="sim-progress-count"></span>
+            </div>
+            <div class="h-3 rounded-full bg-slate-100 overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="sim-progress">
+              <div id="sim-progress-bar" class="h-full bg-emerald-600 w-0"></div>
+            </div>
+          </div>
+          <dl class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+            <div class="rounded-md bg-slate-50 px-3 py-2">
+              <dt class="text-slate-500">Receipts created</dt>
+              <dd id="sim-created" class="text-lg font-semibold">0</dd>
+            </div>
+            <div class="rounded-md bg-slate-50 px-3 py-2">
+              <dt class="text-slate-500">Approved</dt>
+              <dd id="sim-approved" class="text-lg font-semibold text-emerald-800">0</dd>
+            </div>
+            <div class="rounded-md bg-slate-50 px-3 py-2">
+              <dt class="text-slate-500">Declined</dt>
+              <dd id="sim-declined" class="text-lg font-semibold text-red-700">0</dd>
+            </div>
+            <div class="rounded-md bg-slate-50 px-3 py-2">
+              <dt class="text-slate-500">Revenue so far</dt>
+              <dd id="sim-revenue" class="text-lg font-semibold">$0.00</dd>
+            </div>
+          </dl>
+          <p id="sim-summary" class="text-sm text-slate-700"></p>
+          <div>
+            <h3 class="text-sm font-semibold text-slate-800 mb-2">Latest receipts</h3>
+            <ul id="sim-feed" class="space-y-1 text-sm text-slate-600 max-h-56 overflow-y-auto">
+              <li>No receipts yet.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="mt-4 bg-white border border-slate-200 rounded-lg p-4">
+          <h3 class="text-sm font-semibold text-slate-800">View recent activity</h3>
+          <p class="mt-1 text-sm text-slate-600">Rows inserted or updated by checkouts in a time window.</p>
+          <form id="activity-form" class="mt-3 space-y-3" novalidate>
+            <fieldset>
+              <legend class="text-sm font-medium text-slate-700 mb-1">Time interval</legend>
+              <div class="flex flex-wrap gap-4">
+                <label class="inline-flex items-center gap-2 text-sm min-h-11">
+                  <input type="radio" name="activity-preset" value="5min" checked> Last 5 minutes
+                </label>
+                <label class="inline-flex items-center gap-2 text-sm min-h-11">
+                  <input type="radio" name="activity-preset" value="1hour"> Last hour
+                </label>
+                <label class="inline-flex items-center gap-2 text-sm min-h-11">
+                  <input type="radio" name="activity-preset" value="custom"> Custom range
+                </label>
+              </div>
+            </fieldset>
+            <div id="activity-custom" class="hidden flex flex-wrap gap-3">
+              <div>
+                <label for="activity-start" class="block text-sm font-medium text-slate-700 mb-1">Start</label>
+                <input id="activity-start" type="datetime-local" class="rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+              </div>
+              <div>
+                <label for="activity-end" class="block text-sm font-medium text-slate-700 mb-1">End</label>
+                <input id="activity-end" type="datetime-local" class="rounded-md border border-slate-300 px-3 py-2 text-sm min-h-11">
+              </div>
+            </div>
+            <p id="activity-error" class="hidden text-sm text-red-700" role="alert"></p>
+            <button type="submit" class="min-h-11 rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800">Show activity</button>
+          </form>
+          <p id="activity-meta" class="mt-3 text-sm text-slate-600"></p>
+          <div id="activity-table" class="mt-2" data-table></div>
+        </div>
+      </section>
+
+      <!-- ========== Admin ========== -->
+      <section id="section-admin" class="hidden" aria-labelledby="admin-heading">
+        <h2 id="admin-heading" class="text-xl font-semibold text-slate-900">Admin / Database Tools</h2>
+        <p class="mt-1 text-sm text-slate-600">These buttons change the mock database in the browser. They do not touch a real server. Delete, reset, and re-initialize ask you to confirm.</p>
+
+        <div class="mt-4 grid gap-3 md:grid-cols-3">
+          <div class="bg-white border border-slate-200 rounded-lg p-4">
+            <h3 class="text-sm font-semibold">Create All Tables</h3>
+            <p class="mt-1 text-sm text-slate-600">Sends the CREATE TABLE statements. Does not delete rows.</p>
+            <button type="button" id="btn-create-tables" class="mt-3 min-h-11 rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800">Create All Tables</button>
+          </div>
+          <div class="bg-white border border-slate-200 rounded-lg p-4">
+            <h3 class="text-sm font-semibold">Initialize Lookup Tables</h3>
+            <p class="mt-1 text-sm text-slate-600">Reloads Store, Product, Inventory, and BankAccount from the seed data.</p>
+            <button type="button" id="btn-init-lookups" class="mt-3 min-h-11 rounded-md border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-800 hover:bg-red-50">Initialize Lookup Tables</button>
+          </div>
+          <div class="bg-white border border-slate-200 rounded-lg p-4">
+            <h3 class="text-sm font-semibold">Reset Transaction Tables</h3>
+            <p class="mt-1 text-sm text-slate-600">Deletes every Receipt, ReceiptItem, and Payment row.</p>
+            <button type="button" id="btn-reset-tx" class="mt-3 min-h-11 rounded-md border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-800 hover:bg-red-50">Reset Transaction Tables</button>
+          </div>
+        </div>
+
+        <div class="mt-4 bg-white border border-slate-200 rounded-lg p-4">
+          <h3 class="text-sm font-semibold">Row counts</h3>
+          <ul id="admin-counts" class="mt-2 grid gap-1 sm:grid-cols-2 text-sm text-slate-700"></ul>
+        </div>
+
+        <div class="mt-4 bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+          <h3 class="text-sm font-semibold">Per-table tools</h3>
+          <div class="flex flex-wrap items-end gap-2">
+            <div class="flex-1 min-w-[12rem]">
+              <label for="admin-table-select" class="block text-sm font-medium text-slate-700 mb-1">Table</label>
+              <select id="admin-table-select" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm min-h-11">
+                <option value="Store">Store</option>
+                <option value="Product">Product</option>
+                <option value="Inventory">Inventory</option>
+                <option value="Receipt">Receipt</option>
+                <option value="ReceiptItem">ReceiptItem</option>
+                <option value="Payment">Payment</option>
+                <option value="BankAccount">BankAccount</option>
+              </select>
+            </div>
+            <button type="button" id="btn-browse" class="min-h-11 rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800">Browse 10 rows</button>
+            <button type="button" id="btn-delete-rows" class="min-h-11 rounded-md border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-800 hover:bg-red-50">Delete all rows</button>
+          </div>
+          <p id="admin-meta" class="text-sm text-slate-600"></p>
+          <div id="admin-table" data-table></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- SQL log. Every stub returns the SQL it would send, and ui.js appends it here. -->
+  <aside id="sql-panel" class="fixed inset-x-0 bottom-0 z-40 border-t border-slate-700 bg-slate-900 text-slate-100" aria-label="SQL sent to server">
+    <div class="flex flex-wrap items-center gap-2 px-3 py-2">
+      <button type="button" id="sql-toggle" class="min-h-11 text-sm font-medium text-left flex-1" aria-expanded="true" aria-controls="sql-log">
+        SQL Sent to Server
+        <span id="sql-count" class="ml-2 text-slate-400 font-normal">0</span>
+      </button>
+      <button type="button" id="sql-copy" class="min-h-11 rounded-md border border-slate-600 px-3 py-1.5 text-sm hover:bg-slate-800">Copy</button>
+      <button type="button" id="sql-clear" class="min-h-11 rounded-md border border-slate-600 px-3 py-1.5 text-sm hover:bg-slate-800">Clear</button>
+    </div>
+    <pre id="sql-log" class="max-h-32 overflow-auto px-3 pb-3 text-xs leading-relaxed font-mono whitespace-pre-wrap"></pre>
+  </aside>
+
+  <div id="toast-root" class="fixed top-4 right-4 z-50 flex w-[min(100%-2rem,22rem)] flex-col gap-2" aria-live="polite"></div>
+
+  <div id="modal-root" class="hidden fixed inset-0 z-50" role="presentation">
+    <div class="absolute inset-0 bg-slate-900/40" data-modal-backdrop></div>
+    <div class="relative mx-auto mt-24 w-[min(100%-2rem,28rem)] rounded-lg bg-white p-5 shadow-lg" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-body">
+      <h2 id="modal-title" class="text-lg font-semibold text-slate-900"></h2>
+      <p id="modal-body" class="mt-2 text-sm text-slate-700"></p>
+      <div class="mt-4 flex justify-end gap-2">
+        <button type="button" id="modal-cancel" class="min-h-11 rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium">Cancel</button>
+        <button type="button" id="modal-confirm" class="min-h-11 rounded-md bg-red-700 px-4 py-2 text-sm font-medium text-white hover:bg-red-800">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <noscript>
+    <p class="p-4">This page needs JavaScript. Enable it and open home.html again.</p>
+  </noscript>
+
+  <!-- Classic scripts, not modules, so the page works from a double-click (file://). -->
+  <script src="js/ui.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
