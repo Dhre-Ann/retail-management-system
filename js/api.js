@@ -61,7 +61,14 @@ const API = (function () {
     'weight',
     'line_total',
     'payment_id',
-    'amount'
+    'amount',
+    'num_receipts',
+    'total_sales',
+    'units_sold',
+    'lbs_sold',
+    'revenue',
+    'tax_collected',
+    'num_payments'
   ]);
 
   const MONEY_KEYS = new Set([
@@ -71,7 +78,10 @@ const API = (function () {
     'tax_amount',
     'total_amount',
     'line_total',
-    'amount'
+    'amount',
+    'total_sales',
+    'revenue',
+    'tax_collected'
   ]);
 
   function fail(message, sql, ms) {
@@ -320,17 +330,283 @@ const API = (function () {
     return { data: body, sql, ms };
   }
 
+  const SALES_BY_STORE_SQL = [
+    'SELECT',
+    '    s.store_id,',
+    '    s.store_name,',
+    '    s.city,',
+    '    s.state,',
+    '    COUNT(r.receipt_id) AS num_receipts,',
+    '    COALESCE(SUM(r.total_amount), 0) AS total_sales',
+    'FROM supermarkets.store s',
+    'LEFT JOIN supermarkets.receipt r',
+    '    ON r.store_id = s.store_id',
+    '    AND r.receipt_date BETWEEN $1 AND $2',
+    'GROUP BY s.store_id, s.store_name, s.city, s.state',
+    'ORDER BY total_sales DESC;'
+  ].join('\n');
+
+  const TOP_PRODUCTS_SQL = [
+    'SELECT',
+    '    p.sku,',
+    '    p.product_name,',
+    '    p.category,',
+    '    COALESCE(SUM(ri.quantity), 0) AS units_sold,',
+    '    COALESCE(SUM(ri.weight), 0) AS lbs_sold,',
+    '    COALESCE(SUM(ri.line_total), 0) AS revenue',
+    'FROM supermarkets.receiptitem ri',
+    'JOIN supermarkets.product p',
+    '    ON p.sku = ri.sku',
+    'GROUP BY p.sku, p.product_name, p.category',
+    'ORDER BY revenue DESC',
+    'LIMIT $1;'
+  ].join('\n');
+
+  const TAX_BY_STATE_SQL = [
+    'SELECT',
+    '    st.state,',
+    '    st.tax_rate,',
+    '    COUNT(r.receipt_id) AS num_receipts,',
+    '    COALESCE(SUM(r.subtotal), 0) AS subtotal,',
+    '    COALESCE(SUM(r.tax_amount), 0) AS tax_collected',
+    'FROM supermarkets.statetax st',
+    'JOIN supermarkets.store s',
+    '    ON s.state = st.state',
+    'LEFT JOIN supermarkets.receipt r',
+    '    ON r.store_id = s.store_id',
+    'GROUP BY st.state, st.tax_rate',
+    'ORDER BY tax_collected DESC;'
+  ].join('\n');
+
+  const SALES_BY_STATE_SQL = [
+    'SELECT',
+    '    s.state,',
+    '    COUNT(r.receipt_id) AS num_receipts,',
+    '    COALESCE(SUM(r.total_amount), 0) AS total_sales',
+    'FROM supermarkets.store s',
+    'LEFT JOIN supermarkets.receipt r',
+    '    ON r.store_id = s.store_id',
+    'GROUP BY s.state',
+    'ORDER BY total_sales DESC;'
+  ].join('\n');
+
+  const LOW_STOCK_SQL = [
+    'SELECT',
+    '    s.state,',
+    '    s.store_id,',
+    '    s.store_name,',
+    '    p.sku,',
+    '    p.product_name,',
+    '    i.available_quantity,',
+    '    p.unit_of_measure',
+    'FROM supermarkets.inventory i',
+    'JOIN supermarkets.store s',
+    '    ON s.store_id = i.store_id',
+    'JOIN supermarkets.product p',
+    '    ON p.sku = i.sku',
+    'WHERE i.available_quantity < 10',
+    'ORDER BY s.state, i.available_quantity ASC;'
+  ].join('\n');
+
+  const PAYMENTS_BY_METHOD_SQL = [
+    'SELECT',
+    '    payment_method,',
+    '    payment_status,',
+    '    COUNT(*) AS num_payments,',
+    '    COALESCE(SUM(amount), 0) AS total_amount',
+    'FROM supermarkets.payment',
+    'GROUP BY payment_method, payment_status',
+    'ORDER BY payment_method, payment_status;'
+  ].join('\n');
+
+  function isoDate(value) {
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+  }
+
+  function reportTable(title, columns, rows, emptyMessage, sql, ms) {
+    return {
+      data: {
+        title,
+        columns,
+        rows: rows.map(coerceRow),
+        emptyMessage
+      },
+      sql,
+      ms
+    };
+  }
+
+  async function salesByStore(params) {
+    const start = params && params.start_date;
+    const end = params && params.end_date;
+    const sql = [
+      `GET /api/reports/sales-by-store?start_date=${isoDate(start) ? start : ''}&end_date=${isoDate(end) ? end : ''}`,
+      SALES_BY_STORE_SQL,
+      `-- $1 = ${isoDate(start) ? start : 'invalid'}`,
+      `-- $2 = ${isoDate(end) ? end : 'invalid'}`
+    ].join('\n');
+    if (!isoDate(start) || !isoDate(end)) {
+      throw fail('Sales by store failed: choose both a start date and an end date.', sql, 0);
+    }
+    if (start > end) {
+      throw fail('Sales by store failed: the start date is after the end date.', sql, 0);
+    }
+    const path = `/api/reports/sales-by-store?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}`;
+    const { body, ms } = await request('GET', path, sql);
+    const rows = expectArray(body, 'Sales by store', sql, ms);
+    return reportTable(
+      'Sales total per store',
+      [
+        { key: 'store_id', label: 'store_id', align: 'right' },
+        { key: 'store_name', label: 'store_name' },
+        { key: 'city', label: 'city' },
+        { key: 'state', label: 'state' },
+        { key: 'num_receipts', label: 'num_receipts', align: 'right', format: 'number' },
+        { key: 'total_sales', label: 'total_sales', align: 'right', format: 'money' }
+      ],
+      rows,
+      'No stores were returned for this date range.',
+      sql,
+      ms
+    );
+  }
+
+  async function topProducts(params) {
+    const limit = Number(params && params.limit);
+    const shown = LIMITS.includes(limit) ? limit : 'invalid';
+    const sql = [
+      `GET /api/reports/top-products?limit=${shown}`,
+      TOP_PRODUCTS_SQL,
+      `-- $1 = ${shown}`
+    ].join('\n');
+    if (!LIMITS.includes(limit)) {
+      throw fail('Top-selling products failed: limit must be 10, 25, 50, or 100.', sql, 0);
+    }
+    const { body, ms } = await request('GET', `/api/reports/top-products?limit=${limit}`, sql);
+    const rows = expectArray(body, 'Top-selling products', sql, ms);
+    return reportTable(
+      'Top-selling products',
+      [
+        { key: 'sku', label: 'sku' },
+        { key: 'product_name', label: 'product_name' },
+        { key: 'category', label: 'category' },
+        { key: 'units_sold', label: 'units_sold', align: 'right', format: 'number' },
+        { key: 'lbs_sold', label: 'lbs_sold', align: 'right', format: 'number' },
+        { key: 'revenue', label: 'revenue', align: 'right', format: 'money' }
+      ],
+      rows,
+      'No products have been sold yet.',
+      sql,
+      ms
+    );
+  }
+
+  async function taxByState() {
+    const sql = [
+      'GET /api/reports/tax-by-state',
+      TAX_BY_STATE_SQL
+    ].join('\n');
+    const { body, ms } = await request('GET', '/api/reports/tax-by-state', sql);
+    const rows = expectArray(body, 'Tax by state', sql, ms);
+    return reportTable(
+      'Tax collected per state',
+      [
+        { key: 'state', label: 'state' },
+        { key: 'tax_rate', label: 'tax_rate', align: 'right', format: 'percent' },
+        { key: 'num_receipts', label: 'num_receipts', align: 'right', format: 'number' },
+        { key: 'subtotal', label: 'subtotal', align: 'right', format: 'money' },
+        { key: 'tax_collected', label: 'tax_collected', align: 'right', format: 'money' }
+      ],
+      rows,
+      'No state tax totals were returned.',
+      sql,
+      ms
+    );
+  }
+
+  async function salesByState() {
+    const sql = [
+      'GET /api/reports/sales-by-state',
+      SALES_BY_STATE_SQL
+    ].join('\n');
+    const { body, ms } = await request('GET', '/api/reports/sales-by-state', sql);
+    const rows = expectArray(body, 'Sales by state', sql, ms);
+    return reportTable(
+      'Sales total per state',
+      [
+        { key: 'state', label: 'state' },
+        { key: 'num_receipts', label: 'num_receipts', align: 'right', format: 'number' },
+        { key: 'total_sales', label: 'total_sales', align: 'right', format: 'money' }
+      ],
+      rows,
+      'No state sales totals were returned.',
+      sql,
+      ms
+    );
+  }
+
+  async function lowStock() {
+    const sql = [
+      'GET /api/reports/low-stock',
+      LOW_STOCK_SQL
+    ].join('\n');
+    const { body, ms } = await request('GET', '/api/reports/low-stock', sql);
+    const rows = expectArray(body, 'Low stock', sql, ms);
+    return reportTable(
+      'Low-stock items',
+      [
+        { key: 'state', label: 'state' },
+        { key: 'store_id', label: 'store_id', align: 'right' },
+        { key: 'store_name', label: 'store_name' },
+        { key: 'sku', label: 'sku' },
+        { key: 'product_name', label: 'product_name' },
+        { key: 'available_quantity', label: 'available_quantity', align: 'right', format: 'number' },
+        { key: 'unit_of_measure', label: 'unit_of_measure' }
+      ],
+      rows,
+      'No items have available quantity under 10.',
+      sql,
+      ms
+    );
+  }
+
+  async function paymentsByMethod() {
+    const sql = [
+      'GET /api/reports/payments-by-method',
+      PAYMENTS_BY_METHOD_SQL
+    ].join('\n');
+    const { body, ms } = await request('GET', '/api/reports/payments-by-method', sql);
+    const rows = expectArray(body, 'Payments by method', sql, ms);
+    return reportTable(
+      'Payments by method',
+      [
+        { key: 'payment_method', label: 'payment_method' },
+        { key: 'payment_status', label: 'payment_status' },
+        { key: 'num_payments', label: 'num_payments', align: 'right', format: 'number' },
+        { key: 'total_amount', label: 'total_amount', align: 'right', format: 'money' }
+      ],
+      rows,
+      'No payments have been recorded.',
+      sql,
+      ms
+    );
+  }
+
   async function runReport(reportId, params) {
     if (reportId === 'receipt-lookup') return lookupReceipt(params || {});
-    const waiting = {
-      'sales-by-store': 'Sales by store is not connected to PostgreSQL yet.',
-      'sales-by-state': 'Sales by state is not connected to PostgreSQL yet.',
-      'top-products': 'Top-selling products is not connected to PostgreSQL yet.',
-      'low-stock': 'Low stock is not connected to PostgreSQL yet.',
-      'tax-by-state': 'Tax by state is not connected to PostgreSQL yet.',
-      'payments-by-method': 'Payments by method is not connected to PostgreSQL yet.'
+    const reports = {
+      'sales-by-store': salesByStore,
+      'top-products': topProducts,
+      'tax-by-state': taxByState,
+      'sales-by-state': salesByState,
+      'low-stock': lowStock,
+      'payments-by-method': paymentsByMethod
     };
-    pending(waiting[reportId] || `Report "${reportId}" is not available. Nothing was queried.`);
+    const run = reports[reportId];
+    if (!run) {
+      pending(`Report "${reportId}" is not available. Nothing was queried.`);
+    }
+    return run(params || {});
   }
 
   async function lookupReceipt(params) {

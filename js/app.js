@@ -166,6 +166,7 @@ const App = (function () {
       };
       if (column.format === 'money') copy.format = UI.formatMoney;
       else if (column.format === 'percent') copy.format = UI.formatPercent;
+      else if (column.format === 'number') copy.format = UI.formatNumber;
       else if (typeof column.format === 'function') copy.format = column.format;
       return copy;
     });
@@ -700,6 +701,7 @@ const App = (function () {
     });
     el('report-prompt').classList.toggle('hidden', Boolean(reportId));
     el('params-dates').classList.toggle('hidden', reportId !== 'sales-by-store');
+    el('params-limit').classList.toggle('hidden', reportId !== 'top-products');
     el('params-threshold').classList.toggle('hidden', reportId !== 'low-stock');
     el('params-receipt').classList.toggle('hidden', reportId !== 'receipt-lookup');
     UI.showError('report-error', '');
@@ -717,13 +719,12 @@ const App = (function () {
       }
       return { params: { start_date: start, end_date: end } };
     }
-    if (state.reportId === 'low-stock') {
-      const raw = el('report-threshold').value.trim();
-      const threshold = Number(raw);
-      if (raw === '' || !Number.isFinite(threshold) || threshold < 0) {
-        return { error: 'Report did not run: the low-stock threshold must be a number zero or greater.' };
+    if (state.reportId === 'top-products') {
+      const limit = Number(el('report-limit').value);
+      if (![10, 25, 50, 100].includes(limit)) {
+        return { error: 'Report did not run: choose a limit of 10, 25, 50, or 100.' };
       }
-      return { params: { threshold } };
+      return { params: { limit } };
     }
     if (state.reportId === 'receipt-lookup') {
       const raw = el('report-receipt-id').value.trim();
@@ -750,7 +751,7 @@ const App = (function () {
     UI.renderTable(el('report-table'), {
       columns: decorateColumns(data.columns),
       rows: data.rows || [],
-      emptyMessage: 'No rows matched this report.'
+      emptyMessage: data.emptyMessage || 'No rows matched this report.'
     });
     state.reportReady = true;
     el('export-csv-btn').disabled = false;
