@@ -2,11 +2,10 @@
  * app.js — navigation, screen state, validation, and event wiring.
  *
  * This file calls API.* for data and UI.* for drawing. It does not build SQL
- * and it does not know how the rows are stored. Wiring the real backend later
- * means editing js/api.js only.
+ * and it does not know how the rows are stored.
  *
  * The cart total is a preview. Checkout sends SKUs and quantities only.
- * api.js looks up the price and tax again, and the receipt is the result that counts.
+ * The server prices the sale. The confirmation shows that result.
  */
 'use strict';
 
@@ -582,19 +581,37 @@ const App = (function () {
     state.checkingOut = true;
     el('checkout-btn').disabled = true;
     el('checkout-btn').textContent = 'Checking out…';
+    clearReceipt();
+    let presented = false;
     try {
       const result = await callApi(() => API.checkout(payload));
-      renderReceipt(result.data, result.ms);
-      if (result.data.saved) {
+      const data = result.data;
+      let heldError = '';
+      if (data.saved === true && data.payment_status === 'approved') {
+        renderReceipt(data, result.ms, method);
+        presented = true;
         state.cart = [];
         renderCart();
-        UI.toast(`Sale approved. Receipt ${result.data.receipt.receipt_id}. Transaction time ${result.ms} ms.`, 'success');
-      } else {
+        const receiptLabel = data.receipt_id == null ? 'Sale approved.' : `Sale approved. Receipt ${data.receipt_id}.`;
+        UI.toast(`${receiptLabel} Transaction time ${result.ms} ms.`, 'success');
+      } else if (data.saved === false) {
+        renderReceipt(data, result.ms, method);
+        presented = true;
         renderCart();
-        UI.toast(`Card declined. ${result.data.payment.decline_reason} No receipt was saved. Transaction time ${result.ms} ms.`, 'error');
+        const reason = typeof data.message === 'string' && data.message
+          ? data.message
+          : 'Payment was not approved.';
+        UI.toast(`Payment declined. ${reason}. No receipt was saved. Transaction time ${result.ms} ms.`, 'error');
+      } else {
+        heldError = typeof data.message === 'string' && data.message
+          ? data.message
+          : 'Checkout returned an unexpected response.';
+        UI.toast(heldError, 'error');
       }
       await reloadReference();
+      if (heldError) UI.showError('checkout-error', heldError);
     } catch (err) {
+      if (!presented) clearReceipt();
       UI.showError('checkout-error', err.message || 'Checkout failed.');
       UI.toast(err.message || 'Checkout failed.', 'error');
     } finally {
@@ -604,87 +621,68 @@ const App = (function () {
     }
   }
 
-  function receiptHtml(data, ms) {
-    const declined = data.payment && data.payment.payment_status === 'declined';
-    const statusClass = declined
-      ? 'bg-red-50 text-red-800 border border-red-200'
-      : 'bg-emerald-50 text-emerald-900 border border-emerald-200';
-    const statusText = declined ? 'Declined' : 'Approved';
-    const receiptId = data.receipt ? data.receipt.receipt_id : 'Not issued';
-    const when = data.receipt
-      ? `${data.receipt.date} ${data.receipt.time}`
-      : `${data.payment.payment_date} ${data.payment.payment_time}`;
-    const rows = (data.items || []).map((item) => {
-      const measure = item.weight != null ? `${Number(item.weight).toFixed(2)} lb` : String(item.quantity);
-      return `<tr class="border-t border-slate-100">
-        <td class="py-1 pr-2">${item.receipt_line_number}</td>
-        <td class="py-1 pr-2">${escapeHtml(item.sku)}</td>
-        <td class="py-1 pr-2">${escapeHtml(item.product_name)}</td>
-        <td class="py-1 pr-2">${escapeHtml(measure)}</td>
-        <td class="py-1 pr-2 text-right">${UI.formatMoney(item.unit_price)}</td>
-        <td class="py-1 text-right">${UI.formatMoney(item.line_total)}</td>
-      </tr>`;
-    }).join('');
-    const reason = data.payment && data.payment.decline_reason
-      ? `<p class="mt-2 text-sm text-red-800">${escapeHtml(data.payment.decline_reason)} No receipt was saved, and the cart was kept.</p>`
-      : '';
-    const balanceLabel = declined ? 'Account balance (unchanged)' : 'Account balance after payment';
-    const balance = data.payment && data.payment.account_balance_after != null
-      ? `<p class="mt-2 text-sm">${balanceLabel}: ${UI.formatMoney(data.payment.account_balance_after)}</p>`
-      : '';
-    const holder = data.payment && data.payment.account_holder_name
-      ? `<div class="flex justify-between gap-3"><dt>Account</dt><dd>${escapeHtml(data.payment.account_holder_name)}</dd></div>`
-      : '';
+  function clearReceipt() {
+    const view = el('receipt-view');
+    view.classList.add('hidden');
+    view.innerHTML = '';
+  }
+
+  function methodLabel(method) {
+    if (method === 'cash') return 'Cash';
+    if (method === 'card') return 'Card';
+    return method ? String(method) : '';
+  }
+
+  function receiptHtml(data, ms, paymentMethod) {
+    if (!data || typeof data.saved !== 'boolean') {
+      return '<p class="text-sm text-slate-600">This result does not include a checkout receipt.</p>';
+    }
     const timing = ms == null ? '' : `<p class="mt-2 text-sm text-slate-600">Transaction time: ${ms} ms</p>`;
-    const lookup = data.receipt
-      ? `<button type="button" data-lookup-receipt="${data.receipt.receipt_id}" class="mt-3 text-sm font-medium text-emerald-800 underline">Open this receipt in Back Office</button>`
+    const method = methodLabel(paymentMethod);
+    if (data.saved === false) {
+      const reason = typeof data.message === 'string' && data.message
+        ? data.message
+        : 'Payment was not approved.';
+      return `
+        <h3 class="text-sm font-semibold text-slate-800">Checkout</h3>
+        <p class="mt-2 rounded-md px-3 py-2 text-sm font-semibold bg-red-50 text-red-800 border border-red-200">Payment declined</p>
+        <p class="mt-2 text-sm text-red-800">${escapeHtml(reason)}. No receipt was saved, and the cart was kept.</p>
+        <dl class="mt-3 space-y-1 text-sm">
+          <div class="flex justify-between gap-3"><dt>Payment method</dt><dd>${escapeHtml(method)}</dd></div>
+        </dl>
+        ${timing}`;
+    }
+    const approved = data.payment_status === 'approved';
+    const statusClass = approved
+      ? 'bg-emerald-50 text-emerald-900 border border-emerald-200'
+      : 'bg-slate-50 text-slate-800 border border-slate-200';
+    const statusText = approved ? 'Purchase approved' : escapeHtml(data.payment_status || 'Saved');
+    const store = selectedStore();
+    const storeRow = store
+      ? `<div class="flex justify-between gap-3"><dt>Store</dt><dd class="text-right">${escapeHtml(store.store_name || '')}</dd></div>`
       : '';
-    const store = data.store || {};
-    const totals = data.totals || {};
+    const lookup = data.receipt_id == null
+      ? ''
+      : `<button type="button" data-lookup-receipt="${escapeHtml(data.receipt_id)}" class="mt-3 text-sm font-medium text-emerald-800 underline">Open this receipt in Back Office</button>`;
     return `
       <h3 class="text-sm font-semibold text-slate-800">Receipt</h3>
-      <p class="mt-2 rounded-md px-3 py-2 text-sm font-semibold ${statusClass}">Payment status: ${statusText}</p>
-      ${reason}
+      <p class="mt-2 rounded-md px-3 py-2 text-sm font-semibold ${statusClass}">${statusText}</p>
       <dl class="mt-3 space-y-1 text-sm">
-        <div class="flex justify-between gap-3"><dt>Receipt ID</dt><dd class="font-medium">${escapeHtml(receiptId)}</dd></div>
-        <div class="flex justify-between gap-3"><dt>Store</dt><dd class="text-right">${escapeHtml(store.store_name || '')}</dd></div>
-        <div class="flex justify-between gap-3"><dt>Address</dt><dd class="text-right">${escapeHtml(store.address || '')}</dd></div>
-        <div class="flex justify-between gap-3"><dt>State</dt><dd>${escapeHtml(store.state || '')}</dd></div>
-        <div class="flex justify-between gap-3"><dt>Date and time</dt><dd>${escapeHtml(when)}</dd></div>
-        <div class="flex justify-between gap-3"><dt>Payment method</dt><dd>${escapeHtml(data.payment ? data.payment.payment_method : '')}</dd></div>
-        ${holder}
+        <div class="flex justify-between gap-3"><dt>Receipt ID</dt><dd class="font-medium">${escapeHtml(data.receipt_id)}</dd></div>
+        ${storeRow}
+        <div class="flex justify-between gap-3"><dt>Payment method</dt><dd>${escapeHtml(method)}</dd></div>
+        <div class="flex justify-between gap-3"><dt>Subtotal</dt><dd>${UI.formatMoney(data.subtotal)}</dd></div>
+        <div class="flex justify-between gap-3"><dt>Tax</dt><dd>${UI.formatMoney(data.tax)}</dd></div>
+        <div class="flex justify-between gap-3 font-semibold"><dt>Total</dt><dd>${UI.formatMoney(data.total)}</dd></div>
       </dl>
-      <div class="mt-3 overflow-x-auto">
-        <table class="min-w-[28rem] w-full text-sm">
-          <thead>
-            <tr class="text-left text-slate-500">
-              <th scope="col" class="pr-2 font-medium">Line</th>
-              <th scope="col" class="pr-2 font-medium">SKU</th>
-              <th scope="col" class="pr-2 font-medium">Item</th>
-              <th scope="col" class="pr-2 font-medium">Qty / weight</th>
-              <th scope="col" class="pr-2 text-right font-medium">Unit price</th>
-              <th scope="col" class="text-right font-medium">Line total</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-      <dl class="mt-3 space-y-1 text-sm">
-        <div class="flex justify-between gap-3"><dt>Subtotal</dt><dd>${UI.formatMoney(totals.subtotal)}</dd></div>
-        <div class="flex justify-between gap-3"><dt>Taxable</dt><dd>${UI.formatMoney(totals.taxable)}</dd></div>
-        <div class="flex justify-between gap-3"><dt>Tax-exempt</dt><dd>${UI.formatMoney(totals.exempt)}</dd></div>
-        <div class="flex justify-between gap-3"><dt>Tax (${escapeHtml(store.state || '')} ${UI.formatPercent(totals.tax_rate)})</dt><dd>${UI.formatMoney(totals.tax)}</dd></div>
-        <div class="flex justify-between gap-3 font-semibold"><dt>Total</dt><dd>${UI.formatMoney(totals.total)}</dd></div>
-      </dl>
-      ${balance}
       ${timing}
       ${lookup}`;
   }
 
-  function renderReceipt(data, ms) {
+  function renderReceipt(data, ms, paymentMethod) {
     const view = el('receipt-view');
     view.classList.remove('hidden');
-    view.innerHTML = receiptHtml(data, ms);
+    view.innerHTML = receiptHtml(data, ms, paymentMethod);
     view.scrollIntoView({ block: 'nearest' });
   }
 

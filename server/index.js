@@ -357,7 +357,7 @@ app.post('/api/checkout', async (req, res) => {
 
             if (weighed
                 ? item.quantity != null || !Number.isFinite(amount) ||
-                  amount <= 0 || Math.round(amount * 100) !== amount * 100
+                  amount <= 0 || Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-8
                 : item.weight != null || !Number.isSafeInteger(amount) ||
                   amount <= 0) {
                 throw new Error(`Invalid quantity or weight for ${item.sku}`);

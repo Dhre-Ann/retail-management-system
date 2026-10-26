@@ -3,12 +3,15 @@
  *
  * Screens call the functions at the bottom of this file. Each call returns
  * { data, sql, ms } or throws an Error with .sql and .ms. The sql string is
- * the HTTP request plus the statement the Express route runs. It is recorded
- * in the "SQL Sent to Server" panel.
+ * the HTTP request plus the statement the Express route runs, when that
+ * statement is the same on every call. It is recorded in the "SQL Sent to
+ * Server" panel. Checkout records the request only: the route's statements
+ * depend on the payment method and the result, so listing them would claim
+ * work that may not have run.
  *
  * Features that do not have a route yet throw instead of inventing rows.
  * Nothing in this file writes to the database except the functions that call
- * the existing create, seed, and delete routes.
+ * the existing create, seed, delete, and checkout routes.
  */
 'use strict';
 
@@ -83,14 +86,17 @@ const API = (function () {
     return Number.isFinite(n) ? n : null;
   }
 
-  async function request(method, path, sql) {
+  async function request(method, path, sql, payload) {
     const started = performance.now();
+    const headers = { Accept: 'application/json' };
+    const options = { method, headers };
+    if (payload !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      options.body = JSON.stringify(payload);
+    }
     let response;
     try {
-      response = await fetch(BASE + path, {
-        method,
-        headers: { Accept: 'application/json' }
-      });
+      response = await fetch(BASE + path, options);
     } catch (err) {
       const ms = Math.round(performance.now() - started);
       throw fail(
@@ -290,8 +296,28 @@ const API = (function () {
     return { data, sql, ms };
   }
 
-  async function checkout() {
-    pending('Checkout is not connected to PostgreSQL yet. No sale was saved.');
+  function checkoutSql(payload) {
+    const lines = ['POST /api/checkout'];
+    if (payload === undefined) {
+      lines.push('-- No request body was sent.');
+    } else {
+      lines.push('-- Request body:');
+      JSON.stringify(payload, null, 2).split('\n').forEach((line) => {
+        lines.push(`-- ${line}`);
+      });
+    }
+    lines.push('-- The server runs checkout in one transaction. Which statements run');
+    lines.push('-- depends on the payment method and the result, so they are not listed here.');
+    return lines.join('\n');
+  }
+
+  async function checkout(payload) {
+    const sql = checkoutSql(payload);
+    const { body, ms } = await request('POST', '/api/checkout', sql, payload);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.saved !== 'boolean') {
+      throw fail('Checkout returned an unexpected response.', sql, ms);
+    }
+    return { data: body, sql, ms };
   }
 
   async function runReport(reportId, params) {
