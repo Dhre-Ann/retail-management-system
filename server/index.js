@@ -250,6 +250,39 @@ app.get('/api/tables/:tableName', async (req, res) => {
 });
 
 
+// endpoint to delete all rows from a table
+
+app.delete('/api/tables/:tableName', async (req, res) => {
+    const { tableName } = req.params;
+    const schema = allowedTables[tableName];
+
+    if (!schema) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Invalid table name'
+        });
+    }
+
+    try {
+        const result = await pool.query(
+            `DELETE FROM ${schema}.${tableName}`
+        );
+
+        res.json({
+            status: 'success',
+            message: `${result.rowCount} rows deleted from ${tableName}.`
+        });
+
+    } catch (error) {
+        console.error('Error deleting rows:', error.message);
+
+        res.status(500).json({
+            status: 'error',
+            message: 'Unable to delete rows. The table may be referenced by other tables.'
+        });
+    }
+});
+
 
 
 module.exports = app;
