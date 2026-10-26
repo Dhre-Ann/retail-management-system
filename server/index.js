@@ -73,6 +73,38 @@ app.post('/api/create-tables', async (req, res) => {
     }
 });
 
+// endpoint to initialize with seed data
+app.post('/api/initialize', async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const seedPath = path.join(__dirname, '..', 'sql', 'seed.sql');
+        const sql = await fs.readFile(seedPath, 'utf8');
+
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query('COMMIT');
+
+        res.json({
+            status: 'success',
+            message: 'Database seeded successfully.'
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+
+        console.error('Error seeding data:', error.message);
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+
+    } finally {
+        client.release();
+    }
+});
+
 
 // endpoint to query stores table and return a list of stores as JSON
 app.get('/api/stores', async (req, res) => {

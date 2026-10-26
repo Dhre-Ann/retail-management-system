@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS supermarkets.product (
     product_name VARCHAR(100) NOT NULL,
     category VARCHAR(50) NOT NULL,
     tax_treatment VARCHAR(20)
-        CHECK (tax_treatment IN ('taxable', 'tax exempt')),
+        CHECK (tax_treatment IN ('taxable', 'exempt')),
     unit_price NUMERIC(10,2) NOT NULL,
     sold_by_weight BOOLEAN NOT NULL,
     unit_of_measure VARCHAR(10) NOT NULL
