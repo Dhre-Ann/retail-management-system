@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS supermarkets.product (
 CREATE TABLE IF NOT EXISTS supermarkets.inventory (
     store_id INT,
     sku VARCHAR(50),
-    available_quantity INT NOT NULL
+    available_quantity NUMERIC(10,2) NOT NULL
         CHECK (available_quantity >= 0),
     aisle_number INT,
     PRIMARY KEY (store_id, sku),

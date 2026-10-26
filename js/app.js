@@ -11,7 +11,18 @@
 'use strict';
 
 const App = (function () {
-  const STATE_NAMES = { TX: 'Texas', GA: 'Georgia', NY: 'New York', CO: 'Colorado' };
+  const STATE_NAMES = {
+    TX: 'Texas',
+    GA: 'Georgia',
+    NY: 'New York',
+    CO: 'Colorado',
+    FL: 'Florida',
+    CA: 'California',
+    IL: 'Illinois',
+    WA: 'Washington',
+    AZ: 'Arizona',
+    NC: 'North Carolina'
+  };
 
   const state = {
     stores: [],
@@ -19,6 +30,8 @@ const App = (function () {
     accounts: [],
     inventory: [],
     counts: [],
+    countsPending: true,
+    countsMessage: '',
     cart: [],
     checkingOut: false,
     reportId: '',
@@ -125,7 +138,7 @@ const App = (function () {
 
   function previewTotals() {
     const store = selectedStore();
-    const rate = store ? store.tax_rate : 0;
+    const rate = store && Number.isFinite(Number(store.tax_rate)) ? Number(store.tax_rate) : null;
     let taxableCents = 0;
     let exemptCents = 0;
     state.cart.forEach((line) => {
@@ -133,14 +146,15 @@ const App = (function () {
       if (line.tax_treatment === 'taxable') taxableCents += cents;
       else exemptCents += cents;
     });
-    const taxCents = Math.round(taxableCents * rate);
+    const subtotalCents = taxableCents + exemptCents;
+    const taxCents = rate == null ? null : Math.round(taxableCents * rate);
     return {
-      subtotal: fromCents(taxableCents + exemptCents),
+      subtotal: fromCents(subtotalCents),
       taxable: fromCents(taxableCents),
       exempt: fromCents(exemptCents),
-      tax: fromCents(taxCents),
+      tax: taxCents == null ? null : fromCents(taxCents),
       tax_rate: rate,
-      total: fromCents(taxableCents + exemptCents + taxCents)
+      total: taxCents == null ? fromCents(subtotalCents) : fromCents(subtotalCents + taxCents)
     };
   }
 
@@ -214,8 +228,8 @@ const App = (function () {
 
   function renderCounts() {
     const list = el('admin-counts');
-    if (!state.counts.length) {
-      list.innerHTML = '<li>Row counts have not loaded.</li>';
+    if (state.countsPending || !state.counts.length) {
+      list.innerHTML = `<li>${escapeHtml(state.countsMessage || 'Row counts have not loaded.')}</li>`;
       return;
     }
     list.innerHTML = state.counts.map((row) => (
@@ -259,6 +273,7 @@ const App = (function () {
   }
 
   async function reloadReference() {
+    await callApi(() => API.health());
     const [stores, products, accounts, counts] = await Promise.all([
       callApi(() => API.getStores()),
       callApi(() => API.getProducts()),
@@ -268,7 +283,9 @@ const App = (function () {
     state.stores = stores.data;
     state.products = products.data;
     state.accounts = accounts.data;
-    state.counts = counts.data.counts;
+    state.counts = counts.data.counts || [];
+    state.countsPending = Boolean(counts.data.pending);
+    state.countsMessage = counts.data.message || '';
     const skus = new Set(state.products.map((product) => product.sku));
     const before = state.cart.length;
     state.cart = state.cart.filter((line) => skus.has(line.sku));
@@ -290,11 +307,12 @@ const App = (function () {
     const store = selectedStore();
     const meta = el('store-meta');
     if (!store) {
-      meta.textContent = 'Choose a store. The state sets the price and the tax rate.';
+      meta.textContent = 'Choose a store. Tax comes from that store\'s state. The product price is the unit price in PostgreSQL.';
       return;
     }
     const name = STATE_NAMES[store.state] || store.state;
-    meta.textContent = `${store.address} · ${name} · sample tax rate ${UI.formatPercent(store.tax_rate)}`;
+    const rate = store.tax_rate == null ? 'tax rate unavailable' : `tax rate ${UI.formatPercent(store.tax_rate)}`;
+    meta.textContent = `${store.address} · ${name} · ${rate}`;
   }
 
   function renderProductMeta() {
@@ -315,7 +333,7 @@ const App = (function () {
       product.sold_by_weight ? `${UI.formatMoney(price)} per lb` : UI.formatMoney(price)
     ];
     const stock = stockFor(product.sku);
-    if (!store) parts.push('Select a store to see stock and the state price');
+    if (!store) parts.push('Select a store to see stock');
     else if (!stock) parts.push('Not stocked at this store');
     else if (product.sold_by_weight) parts.push(`In stock: ${stock.available_quantity} lb · aisle ${stock.aisle_number}`);
     else parts.push(`In stock: ${stock.available_quantity} · aisle ${stock.aisle_number}`);
@@ -330,15 +348,20 @@ const App = (function () {
     }
     const store = selectedStore();
     const totals = previewTotals();
-    const rateLabel = store
-      ? `${store.state} ${UI.formatPercent(store.tax_rate)}`
-      : 'select a store';
+    const rateKnown = totals.tax_rate != null;
+    const rateLabel = !store
+      ? 'select a store'
+      : rateKnown
+        ? `${store.state} ${UI.formatPercent(totals.tax_rate)}`
+        : 'rate unavailable';
+    const taxValue = rateKnown ? UI.formatMoney(totals.tax) : '—';
+    const totalLabel = rateKnown ? 'Total' : 'Total before tax';
     panel.innerHTML = `
       <div class="flex justify-between gap-3"><dt>Subtotal</dt><dd>${UI.formatMoney(totals.subtotal)}</dd></div>
       <div class="flex justify-between gap-3"><dt>Taxable</dt><dd>${UI.formatMoney(totals.taxable)}</dd></div>
       <div class="flex justify-between gap-3"><dt>Tax-exempt</dt><dd>${UI.formatMoney(totals.exempt)}</dd></div>
-      <div class="flex justify-between gap-3"><dt>Tax (${escapeHtml(rateLabel)})</dt><dd>${UI.formatMoney(totals.tax)}</dd></div>
-      <div class="flex justify-between gap-3 border-t border-slate-200 pt-2 text-base font-semibold"><dt>Total</dt><dd>${UI.formatMoney(totals.total)}</dd></div>`;
+      <div class="flex justify-between gap-3"><dt>Tax (${escapeHtml(rateLabel)})</dt><dd>${escapeHtml(taxValue)}</dd></div>
+      <div class="flex justify-between gap-3 border-t border-slate-200 pt-2 text-base font-semibold"><dt>${totalLabel}</dt><dd>${UI.formatMoney(totals.total)}</dd></div>`;
   }
 
   function renderCart() {
@@ -385,7 +408,7 @@ const App = (function () {
     if (!state.cart.length) return;
     const total = previewTotals().total;
     if (toCents(account.account_balance) < toCents(total)) {
-      warning.textContent = `This sale is ${UI.formatMoney(total)}. The balance does not cover it, so Checkout will come back Declined. The cart will be kept.`;
+      warning.textContent = `This sale is ${UI.formatMoney(total)}. The balance does not cover it. Checkout cannot record a decline until the payment endpoint exists.`;
       warning.classList.remove('hidden');
     }
   }
@@ -420,7 +443,7 @@ const App = (function () {
     const store = selectedStore();
     const product = selectedProduct();
     if (!store) {
-      UI.showError('add-error', 'Add to cart failed: choose a store first. The price depends on the state.');
+      UI.showError('add-error', 'Add to cart failed: choose a store first. Stock and tax depend on the store.');
       return;
     }
     if (!product) {
@@ -716,7 +739,8 @@ const App = (function () {
 
   function paintReport(result) {
     const data = result.data;
-    el('report-meta').textContent = `${data.title} · query ${result.ms} ms`;
+    const notice = data.notice ? ` · ${data.notice}` : '';
+    el('report-meta').textContent = `${data.title}${notice} · query ${result.ms} ms`;
     const detail = el('receipt-detail');
     if (data.receipt) {
       detail.classList.remove('hidden');
@@ -886,6 +910,7 @@ const App = (function () {
         el('sim-progress-label').textContent = 'Stopped';
         UI.toast('Simulation stopped.', 'info');
       } else {
+        el('sim-progress-label').textContent = 'Not run';
         UI.showError('sim-error', err.message || 'Simulation failed.');
         UI.toast(err.message || 'Simulation failed.', 'error');
       }
@@ -957,12 +982,16 @@ const App = (function () {
 
   async function onCreateTables() {
     if (blockIfSimRunning()) return;
+    const button = el('btn-create-tables');
+    button.disabled = true;
     try {
       const result = await callApi(() => API.createTables());
       UI.toast(result.data.message, 'success');
       await reloadReference();
     } catch (err) {
       UI.toast(err.message || 'Create tables failed.', 'error');
+    } finally {
+      button.disabled = false;
     }
   }
 
@@ -970,46 +999,55 @@ const App = (function () {
     if (blockIfSimRunning()) return;
     const ok = await UI.confirm({
       title: 'Initialize lookup tables?',
-      message: 'This reloads Store, Product, Inventory, and BankAccount with the original seed data. Changes to those tables are replaced. Receipt, ReceiptItem, and Payment rows are kept, but inventory counts and bank balances go back to the seed and will no longer match those receipts.',
-      confirmLabel: 'Reload seed data'
+      message: 'This runs the seed script. It inserts StateTax, Store, Product, Inventory, and BankAccount. It does not delete or replace rows that are already there. If a seed key already exists, the request fails and this run is rolled back. Receipt, ReceiptItem, and Payment are not changed.',
+      confirmLabel: 'Run seed script'
     });
     if (!ok) return;
+    const button = el('btn-init-lookups');
+    button.disabled = true;
     try {
       const result = await callApi(() => API.initLookupTables());
       UI.toast(result.data.message, 'success');
       await reloadReference();
     } catch (err) {
       UI.toast(err.message || 'Initialize lookup tables failed.', 'error');
+    } finally {
+      button.disabled = false;
     }
   }
 
   async function onResetTransactions() {
     if (blockIfSimRunning()) return;
-    const receipts = countFor('Receipt');
-    const items = countFor('ReceiptItem');
-    const payments = countFor('Payment');
-    const ok = await UI.confirm({
-      title: 'Reset transaction tables?',
-      message: `This deletes every Receipt (${receipts}), ReceiptItem (${items}), and Payment (${payments}) row. Store, Product, Inventory, and BankAccount are kept. Inventory quantities and bank balances are not restored.`,
-      confirmLabel: 'Reset tables'
-    });
-    if (!ok) return;
     try {
-      const result = await callApi(() => API.resetTransactionTables());
-      UI.toast(result.data.message, 'success');
-      await reloadReference();
+      await callApi(() => API.resetTransactionTables());
     } catch (err) {
-      UI.toast(err.message || 'Reset failed.', 'error');
+      UI.toast(err.message || 'Reset transaction tables is not connected yet. Nothing was deleted.', 'info');
     }
+  }
+
+  function deleteWarning(tableName) {
+    const notes = {
+      StateTax: 'Stores reference these states, so the delete fails while any store still uses one. No other table is changed.',
+      Store: 'Inventory rows for these stores are deleted too, because inventory cascades from the store. The delete fails if any receipt still points at a store.',
+      Product: 'Inventory rows for these products are deleted too, because inventory cascades from the product. The delete fails if any receipt line still points at a product.',
+      Inventory: 'Only inventory rows are deleted. Stores, products, receipts, and bank balances stay as they are. Stock is not archived.',
+      Receipt: 'Payments for these receipts are deleted too, because payment cascades from the receipt. The delete fails if receipt lines still exist, because receipt lines do not cascade.',
+      ReceiptItem: 'Only receipt lines are deleted. Receipts, payments, and stock stay as they are.',
+      Payment: 'Only payment rows are deleted. Receipts and bank balances stay as they are.',
+      BankAccount: 'The delete fails if any payment still points at an account. Balances are not archived.'
+    };
+    return notes[tableName] || 'Rows in other tables are not updated unless a foreign key cascades.';
   }
 
   async function onBrowse() {
     const tableName = el('admin-table-select').value;
+    const limit = Number(el('admin-row-limit').value);
+    const button = el('btn-browse');
+    button.disabled = true;
     try {
-      const result = await callApi(() => API.browseTable(tableName, 10));
+      const result = await callApi(() => API.browseTable(tableName, limit));
       const shown = result.data.rows.length;
-      const total = countFor(tableName);
-      el('admin-meta').textContent = `${tableName}: showing ${shown} of ${total} row${total === 1 ? '' : 's'} · query ${result.ms} ms`;
+      el('admin-meta').textContent = `${tableName}: ${shown} row${shown === 1 ? '' : 's'} returned (limit ${limit}) · ${result.ms} ms`;
       UI.renderTable(el('admin-table'), {
         columns: decorateColumns(result.data.columns),
         rows: result.data.rows,
@@ -1018,23 +1056,31 @@ const App = (function () {
     } catch (err) {
       el('admin-meta').textContent = '';
       UI.toast(err.message || 'Browse failed.', 'error');
+    } finally {
+      button.disabled = false;
     }
   }
 
   async function onDeleteRows() {
     if (blockIfSimRunning()) return;
     const tableName = el('admin-table-select').value;
+    const known = !state.countsPending;
     const total = countFor(tableName);
-    if (!total) {
+    if (known && !total) {
       UI.toast(`${tableName} has no rows to delete.`, 'info');
       return;
     }
+    const countText = known
+      ? `This deletes all ${total} row${total === 1 ? '' : 's'} in ${tableName}.`
+      : `This deletes every row in ${tableName}. A row count is not available.`;
     const ok = await UI.confirm({
       title: `Delete all rows in ${tableName}?`,
-      message: `This will delete all ${total} row${total === 1 ? '' : 's'} in ${tableName}. Other tables are not changed, even if they still point at these rows. This cannot be undone in the mock database.`,
+      message: `${countText} ${deleteWarning(tableName)} This cannot be undone.`,
       confirmLabel: 'Delete rows'
     });
     if (!ok) return;
+    const button = el('btn-delete-rows');
+    button.disabled = true;
     try {
       const result = await callApi(() => API.deleteAllRows(tableName));
       UI.toast(result.data.message, 'success');
@@ -1043,6 +1089,8 @@ const App = (function () {
       await reloadReference();
     } catch (err) {
       UI.toast(err.message || 'Delete failed.', 'error');
+    } finally {
+      button.disabled = false;
     }
   }
 
@@ -1059,7 +1107,7 @@ const App = (function () {
     el('store-select').addEventListener('change', async () => {
       if (state.cart.length) {
         state.cart = [];
-        UI.toast('Cart cleared because the store changed. Prices depend on the store\'s state.', 'info');
+        UI.toast('Cart cleared because the store changed. Tax depends on the store\'s state.', 'info');
       }
       renderStoreMeta();
       renderCart();
@@ -1160,7 +1208,16 @@ const App = (function () {
     try {
       await reloadReference();
     } catch (err) {
-      UI.toast(err.message || 'The page could not load mock data.', 'error');
+      const select = el('store-select');
+      if (select && select.options.length === 1) {
+        select.innerHTML = '<option value="">Stores could not be loaded</option>';
+      }
+      if (!state.countsMessage) {
+        state.countsPending = true;
+        state.countsMessage = err.message || 'Row counts did not load because the backend is unavailable.';
+        renderCounts();
+      }
+      UI.toast(err.message || 'The page could not load data from PostgreSQL.', 'error');
     }
   }
 
