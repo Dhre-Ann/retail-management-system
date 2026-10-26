@@ -109,7 +109,7 @@ app.post('/api/initialize', async (req, res) => {
 // endpoint to query stores table and return a list of stores as JSON
 app.get('/api/stores', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM store');
+        const result = await pool.query('SELECT * FROM supermarkets.store');
         res.json(result.rows);
     } catch (error) {
         console.error('Error querying stores table:', error.message);
@@ -123,7 +123,7 @@ app.get('/api/stores', async (req, res) => {
 // endpoint to get products
 app.get('/api/products', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM product');
+        const result = await pool.query('SELECT * FROM supermarkets.product');
         res.json(result.rows);
     } catch (error) {
         console.error('Error querying products table:', error.message);
@@ -140,7 +140,7 @@ app.get('/api/inventory/:storeId', async (req, res) => {
         const { storeId } = req.params;
 
         const result = await pool.query(
-            'SELECT * FROM inventory WHERE store_id = $1',
+            'SELECT * FROM supermarkets.inventory WHERE store_id = $1',
             [storeId]
         );
 
@@ -161,7 +161,7 @@ app.get('/api/inventory/:storeId', async (req, res) => {
 app.get('/api/receipts/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const result = await pool.query('SELECT * FROM receipt WHERE id = $1', [id]);
+        const result = await pool.query('SELECT * FROM supermarkets.receipt WHERE receipt_id = $1', [id]);
         if (result.rows.length === 0) {
             return res.status(404).json({
                 status: 'error',
@@ -177,4 +177,23 @@ app.get('/api/receipts/:id', async (req, res) => {
         });
     }
 });
+
+
+// endpoint to get bank accounts
+app.get('/api/bank-accounts', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM banking.bankaccount');
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error querying bank accounts table:', error.message);
+        res.status(500).json({
+            status: 'error',
+            message: 'Unable to query bank accounts'
+        });
+    }
+});
+
+
+
+
 module.exports = app;
