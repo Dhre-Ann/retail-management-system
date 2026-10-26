@@ -193,6 +193,62 @@ app.get('/api/bank-accounts', async (req, res) => {
     }
 });
 
+// allowed tables and their schemas
+const allowedTables = {
+    statetax: 'supermarkets',
+    store: 'supermarkets',
+    product: 'supermarkets',
+    inventory: 'supermarkets',
+    receipt: 'supermarkets',
+    receiptitem: 'supermarkets',
+    payment: 'supermarkets',
+    bankaccount: 'banking'
+};
+
+// endpoint to browse table records (minimum 10 records)
+app.get('/api/tables/:tableName', async (req, res) => {
+    const { tableName } = req.params;
+    const schema = allowedTables[tableName];
+
+    if (!schema) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Invalid table name'
+        });
+    }
+
+    // Default to 10 rows, allow 25, 50, or 100
+    const limit = req.query.limit === undefined
+        ? 10
+        : Number(req.query.limit);
+
+    const allowedLimits = [10, 25, 50, 100];
+
+    if (!allowedLimits.includes(limit)) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Limit must be 10, 25, 50, or 100'
+        });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT * FROM ${schema}.${tableName} LIMIT $1`,
+            [limit]
+        );
+
+        res.json(result.rows);
+
+    } catch (error) {
+        console.error('Error browsing table:', error.message);
+
+        res.status(500).json({
+            status: 'error',
+            message: 'Unable to browse table'
+        });
+    }
+});
+
 
 
 
