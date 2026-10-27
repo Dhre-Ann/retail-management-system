@@ -6,6 +6,7 @@ const pool = require('./db/pool');
 const adminRoutes = require('./routes/admin');
 const catalogRoutes = require('./routes/catalog');
 const checkoutRoutes = require('./routes/checkout');
+const simulationRoutes = require('./routes/simulation');
 const reportRoutes = require('./routes/reports');
 
 const app = express();
@@ -37,6 +38,7 @@ app.get('/api/health', async (req, res) => {
 app.use('/api', adminRoutes);
 app.use('/api', catalogRoutes);
 app.use('/api', checkoutRoutes);
+app.use('/api', simulationRoutes);
 app.use('/api', reportRoutes);
 
 // start the server
