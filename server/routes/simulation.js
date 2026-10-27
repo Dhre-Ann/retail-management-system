@@ -9,10 +9,8 @@ const router = express.Router();
 
 const DEFAULT_TRANSACTION_COUNT = 10;
 const DEFAULT_CONCURRENCY = 3;
-const MIN_SELECTIONS = 10;
-const MAX_SELECTIONS = 20;
-// keep each sale small so a short demo does not empty the observed stock
-const MAX_PACKAGED_QUANTITY = 2;
+const MIN_ITEMS = 10;
+const MAX_ITEMS = 20;
 const MIN_WEIGHT_CENTS = 25;
 const MAX_WEIGHT_CENTS = 150;
 
@@ -63,27 +61,38 @@ function parseSimulationRequest(body) {
         return { error: 'concurrency cannot be greater than transaction_count' };
     }
 
+    if (!Number.isInteger(body.store_count) || body.store_count < 1) {
+        return { error: 'store_count must be an integer of at least 1' };
+    }
+
+    if (body.store_count > transactionCount.value) {
+        return {
+            error: 'store_count cannot be greater than transaction_count. Each transaction is one store purchase.'
+        };
+    }
+
     return {
         transactionCount: transactionCount.value,
-        concurrency: concurrency.value
+        concurrency: concurrency.value,
+        storeCount: body.store_count
     };
 }
 
-function randomInt(min, max) {
-    return min + Math.floor(Math.random() * (max - min + 1));
-}
-
-function shuffle(list) {
+function sampleDistinct(list, count) {
     const copy = list.slice();
 
     for (let i = copy.length - 1; i > 0; i -= 1) {
-        const j = Math.floor(Math.random() * (i + 1));
+        const j = randomInt(0, i);
         const swap = copy[i];
         copy[i] = copy[j];
         copy[j] = swap;
     }
 
-    return copy;
+    return copy.slice(0, count);
+}
+
+function randomInt(min, max) {
+    return min + Math.floor(Math.random() * (max - min + 1));
 }
 
 function roundMs(value) {
@@ -98,27 +107,90 @@ function roundMoney(value) {
     return Math.round(amount * 100) / 100;
 }
 
-function packagedQuantity(available) {
-    const onHand = Math.floor(Number(available) + 1e-8);
-    if (onHand < 1) {
-        return null;
-    }
-    return randomInt(1, Math.min(onHand, MAX_PACKAGED_QUANTITY));
+function stockCents(available) {
+    return Math.floor(Number(available) * 100 + 1e-8);
 }
 
-// positive hundredths of a unit, capped by the inventory seen while planning
-function weightedAmount(available) {
-    const onHandCents = Math.floor(Number(available) * 100 + 1e-8);
-    if (onHandCents < 1) {
+function packagedUnits(available) {
+    const onHand = Math.floor(Number(available) + 1e-8);
+    return onHand >= 1 ? onHand : 0;
+}
+
+// smallest weight the existing hundredths rule can sell from this balance
+function minimumWeightCents(cents) {
+    if (cents < 1) {
+        return 0;
+    }
+    return Math.min(MIN_WEIGHT_CENTS, cents);
+}
+
+// how many weighted entries fit if each one keeps a valid positive weight
+function weightedEntries(available) {
+    let cents = stockCents(available);
+    let count = 0;
+
+    while (true) {
+        const draw = minimumWeightCents(cents);
+        if (draw < 1) {
+            break;
+        }
+        cents -= draw;
+        count += 1;
+    }
+
+    return count;
+}
+
+function itemCapacity(product) {
+    return product.sold_by_weight
+        ? weightedEntries(product.available)
+        : packagedUnits(product.available);
+}
+
+function reserveLaterCents(cents, laterEntries) {
+    let left = cents;
+    let reserved = 0;
+
+    for (let i = 0; i < laterEntries; i += 1) {
+        const draw = minimumWeightCents(left);
+        if (draw < 1) {
+            return -1;
+        }
+        reserved += draw;
+        left -= draw;
+    }
+
+    return reserved;
+}
+
+// one weight per selected entry, then summed onto a single checkout line
+function aggregateWeight(available, entries) {
+    let centsLeft = stockCents(available);
+    let totalCents = 0;
+
+    for (let i = 0; i < entries; i += 1) {
+        const reserved = reserveLaterCents(centsLeft, entries - i - 1);
+        if (reserved < 0) {
+            return null;
+        }
+
+        const maxCents = centsLeft - reserved;
+        const minCents = minimumWeightCents(maxCents);
+        const cappedMax = Math.min(MAX_WEIGHT_CENTS, maxCents);
+        if (minCents < 1 || minCents > cappedMax) {
+            return null;
+        }
+
+        const drawn = randomInt(minCents, cappedMax);
+        totalCents += drawn;
+        centsLeft -= drawn;
+    }
+
+    if (totalCents < 1 || totalCents > stockCents(available)) {
         return null;
     }
 
-    const cents = randomInt(
-        Math.min(MIN_WEIGHT_CENTS, onHandCents),
-        Math.min(MAX_WEIGHT_CENTS, onHandCents)
-    );
-
-    return cents / 100;
+    return totalCents / 100;
 }
 
 function indexStores(rows) {
@@ -164,55 +236,98 @@ function indexStores(rows) {
     return byStore;
 }
 
-// null means no store currently has enough distinct stocked products for a valid sale
-function buildPurchase(stores, accountIds) {
-    const eligibleStoreIds = [];
+function eligibleStoreIds(stores) {
+    const ids = [];
 
     for (const [storeId, products] of stores) {
-        if (products.length >= MIN_SELECTIONS) {
-            eligibleStoreIds.push(storeId);
+        const capacity = products.reduce((sum, product) => sum + itemCapacity(product), 0);
+        if (capacity >= MIN_ITEMS) {
+            ids.push(storeId);
         }
     }
 
-    if (eligibleStoreIds.length === 0) {
+    return ids;
+}
+
+// The first storeCount assignments cover every selected store.
+// Later purchases stay inside that same set.
+function assignStores(chosen, transactionCount) {
+    const assignments = chosen.slice();
+
+    while (assignments.length < transactionCount) {
+        assignments.push(chosen[randomInt(0, chosen.length - 1)]);
+    }
+
+    for (let i = assignments.length - 1; i > 0; i -= 1) {
+        const j = randomInt(0, i);
+        const swap = assignments[i];
+        assignments[i] = assignments[j];
+        assignments[j] = swap;
+    }
+
+    return assignments;
+}
+
+// null means this store cannot fill a 10-to-20 item purchase
+function buildPurchase(stores, accountIds, storeId) {
+    const products = stores.get(storeId);
+    if (!products) {
         return null;
     }
+    const capacity = products.reduce((sum, product) => sum + itemCapacity(product), 0);
+    if (capacity < MIN_ITEMS) {
+        return null;
+    }
+    const itemCount = randomInt(MIN_ITEMS, Math.min(MAX_ITEMS, capacity));
+    const remaining = new Map();
 
-    const storeId = eligibleStoreIds[randomInt(0, eligibleStoreIds.length - 1)];
-    const products = stores.get(storeId);
-    const selectionCount = randomInt(
-        MIN_SELECTIONS,
-        Math.min(MAX_SELECTIONS, products.length)
-    );
+    products.forEach((product) => {
+        remaining.set(product.sku, itemCapacity(product));
+    });
+
+    const picks = new Map();
+
+    for (let n = 0; n < itemCount; n += 1) {
+        const choices = products.filter((product) => remaining.get(product.sku) > 0);
+        if (choices.length === 0) {
+            return null;
+        }
+
+        const chosen = choices[randomInt(0, choices.length - 1)];
+        remaining.set(chosen.sku, remaining.get(chosen.sku) - 1);
+        picks.set(chosen.sku, (picks.get(chosen.sku) || 0) + 1);
+    }
+
     const items = [];
-    const seen = new Set();
 
-    for (const product of shuffle(products)) {
-        if (seen.has(product.sku)) {
+    for (const product of products) {
+        const count = picks.get(product.sku) || 0;
+        if (count < 1) {
             continue;
         }
-        seen.add(product.sku);
 
         if (product.sold_by_weight) {
-            const weight = weightedAmount(product.available);
+            const weight = aggregateWeight(product.available, count);
             if (weight == null) {
-                continue;
+                return null;
             }
             items.push({ sku: product.sku, weight });
+        } else if (count <= packagedUnits(product.available)) {
+            items.push({ sku: product.sku, quantity: count });
         } else {
-            const quantity = packagedQuantity(product.available);
-            if (quantity == null) {
-                continue;
-            }
-            items.push({ sku: product.sku, quantity });
-        }
-
-        if (items.length === selectionCount) {
-            break;
+            return null;
         }
     }
 
-    if (items.length < MIN_SELECTIONS) {
+    const purchasedItems = items.reduce((sum, item) => {
+        return sum + (item.quantity == null ? 0 : item.quantity);
+    }, 0);
+    const weightedPicks = Array.from(picks.entries()).reduce((sum, [sku, count]) => {
+        const product = products.find((candidate) => candidate.sku === sku);
+        return sum + (product && product.sold_by_weight ? count : 0);
+    }, 0);
+
+    if (purchasedItems + weightedPicks !== itemCount || items.length === 0) {
         return null;
     }
 
@@ -228,10 +343,10 @@ function buildPurchase(stores, accountIds) {
     };
 }
 
-function emptyResult(transactionNumber, elapsedMs, message) {
+function emptyResult(transactionNumber, elapsedMs, message, storeId) {
     return {
         transaction_number: transactionNumber,
-        store_id: null,
+        store_id: Number.isInteger(storeId) ? storeId : null,
         payment_method: null,
         selection_count: 0,
         status: 'failed',
@@ -288,15 +403,16 @@ function checkoutResult(transactionNumber, payload, elapsedMs, result, error) {
     };
 }
 
-async function executePurchase(transactionNumber, stores, accountIds) {
+async function executePurchase(transactionNumber, stores, accountIds, storeId) {
     const plannedAt = performance.now();
-    const payload = buildPurchase(stores, accountIds);
+    const payload = buildPurchase(stores, accountIds, storeId);
 
     if (!payload) {
         return emptyResult(
             transactionNumber,
             performance.now() - plannedAt,
-            'A valid purchase cannot be generated'
+            'A valid purchase cannot be generated',
+            storeId
         );
     }
 
@@ -324,7 +440,7 @@ async function executePurchase(transactionNumber, stores, accountIds) {
 }
 
 // each worker finishes one checkout before taking another index
-async function runTransactions(transactionCount, concurrency, stores, accountIds) {
+async function runTransactions(transactionCount, concurrency, stores, accountIds, assignments) {
     const results = new Array(transactionCount);
     let nextIndex = 0;
 
@@ -338,7 +454,8 @@ async function runTransactions(transactionCount, concurrency, stores, accountIds
                 results[index] = await executePurchase(
                     index + 1,
                     stores,
-                    accountIds
+                    accountIds,
+                    assignments[index]
                 );
             } catch (error) {
                 results[index] = emptyResult(
@@ -443,12 +560,25 @@ router.post('/simulate', async (req, res) => {
 
     try {
         const catalog = await loadCatalog();
+        const eligible = eligibleStoreIds(catalog.stores);
+
+        if (parsed.storeCount > eligible.length) {
+            const noun = eligible.length === 1 ? 'store' : 'stores';
+            return res.status(400).json({
+                status: 'error',
+                message: `Only ${eligible.length} ${noun} can support a valid purchase.`
+            });
+        }
+
+        const chosen = sampleDistinct(eligible, parsed.storeCount);
+        const assignments = assignStores(chosen, parsed.transactionCount);
         // the snapshot is not reduced here. processCheckout decides stock and funds.
         const transactions = await runTransactions(
             parsed.transactionCount,
             parsed.concurrency,
             catalog.stores,
-            catalog.accountIds
+            catalog.accountIds,
+            assignments
         );
 
         res.json({

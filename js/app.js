@@ -281,6 +281,7 @@ const App = (function () {
       callApi(() => API.getRowCounts())
     ]);
     state.stores = stores.data;
+    syncStoreLimit();
     state.products = products.data;
     state.accounts = accounts.data;
     state.counts = counts.data.counts || [];
@@ -798,7 +799,7 @@ const App = (function () {
     state.simRunning = running;
     el('sim-run-btn').disabled = running;
     el('sim-run-btn').textContent = running ? 'Running…' : 'Run Simulation';
-    ['sim-customers', 'sim-concurrency'].forEach((id) => {
+    ['sim-customers', 'sim-stores', 'sim-concurrency'].forEach((id) => {
       el(id).disabled = running;
     });
     const stop = el('stop-btn');
@@ -822,6 +823,13 @@ const App = (function () {
     el('sim-approved').textContent = String(event.approved || 0);
     el('sim-declined').textContent = String(event.declined || 0);
     el('sim-revenue').textContent = UI.formatMoney(event.revenue || 0);
+  }
+
+  function syncStoreLimit() {
+    const input = el('sim-stores');
+    const count = state.stores.length;
+    if (count > 0) input.max = String(count);
+    else input.removeAttribute('max');
   }
 
   function wholeNumber(raw) {
@@ -876,9 +884,23 @@ const App = (function () {
     UI.showError('sim-error', '');
     if (state.simRunning) return;
     const transactionCount = wholeNumber(el('sim-customers').value);
+    const storeCount = wholeNumber(el('sim-stores').value);
     const concurrency = wholeNumber(el('sim-concurrency').value);
+    const storeMax = state.stores.length;
     if (transactionCount == null || transactionCount < 1 || transactionCount > 100) {
       UI.showError('sim-error', 'Simulation did not start: customers / receipts must be a whole number from 1 to 100.');
+      return;
+    }
+    if (storeMax < 1) {
+      UI.showError('sim-error', 'Simulation did not start: the store list has not loaded, so stores involved cannot be checked.');
+      return;
+    }
+    if (storeCount == null || storeCount < 1 || storeCount > storeMax) {
+      UI.showError('sim-error', `Simulation did not start: stores involved must be a whole number from 1 to ${storeMax}.`);
+      return;
+    }
+    if (storeCount > transactionCount) {
+      UI.showError('sim-error', 'Simulation did not start: stores involved cannot be greater than the number of customers / receipts. Each transaction is one store purchase.');
       return;
     }
     if (concurrency == null || concurrency < 1 || concurrency > 10) {
@@ -906,6 +928,7 @@ const App = (function () {
     try {
       const result = await callApi(() => API.runSimulation({
         transaction_count: transactionCount,
+        store_count: storeCount,
         concurrency
       }, state.simController.signal));
       showSimulationResult(result.data);

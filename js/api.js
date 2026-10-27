@@ -813,14 +813,22 @@ const API = (function () {
 
   async function runSimulation(options, signal) {
     const transactionCount = Number(options && options.transaction_count);
+    const storeCount = Number(options && options.store_count);
     const concurrency = Number(options && options.concurrency);
     const payload = {
       transaction_count: transactionCount,
+      store_count: storeCount,
       concurrency
     };
     const sql = simulationSql(payload);
     if (!Number.isInteger(transactionCount) || transactionCount < 1 || transactionCount > 100) {
       throw fail('Simulation did not start: transaction_count must be an integer from 1 to 100.', sql, 0);
+    }
+    if (!Number.isInteger(storeCount) || storeCount < 1) {
+      throw fail('Simulation did not start: store_count must be an integer of at least 1.', sql, 0);
+    }
+    if (storeCount > transactionCount) {
+      throw fail('Simulation did not start: store_count cannot be greater than transaction_count. Each transaction is one store purchase.', sql, 0);
     }
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
       throw fail('Simulation did not start: concurrency must be an integer from 1 to 10.', sql, 0);
