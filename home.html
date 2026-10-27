@@ -412,7 +412,7 @@
       <!-- ========== Admin ========== -->
       <section id="section-admin" class="hidden" aria-labelledby="admin-heading">
         <h2 id="admin-heading" class="text-xl font-semibold text-slate-900">Admin / Database Tools</h2>
-        <p class="mt-1 text-sm text-slate-600">These buttons call the PostgreSQL backend. Create tables and initialize run the schema and seed scripts. Delete removes every row in the chosen table and can cascade. Initialize and delete ask you to confirm. Reset is not connected yet.</p>
+        <p class="mt-1 text-sm text-slate-600">These buttons call the PostgreSQL backend. Create tables and initialize run the schema and seed scripts. Delete removes every row in the chosen table and can cascade. Initialize, reset, and delete ask you to confirm.</p>
 
         <div class="mt-4 grid gap-3 md:grid-cols-3">
           <div class="bg-white border border-slate-200 rounded-lg p-4">
@@ -422,12 +422,12 @@
           </div>
           <div class="bg-white border border-slate-200 rounded-lg p-4">
             <h3 class="text-sm font-semibold">Initialize Lookup Tables</h3>
-            <p class="mt-1 text-sm text-slate-600">Inserts StateTax, Store, Product, Inventory, and BankAccount from the seed file. Fails if those keys already exist.</p>
+            <p class="mt-1 text-sm text-slate-600">Inserts any missing StateTax, Store, Product, Inventory, and BankAccount rows from the seed file. Existing rows are left as they are.</p>
             <button type="button" id="btn-init-lookups" class="mt-3 min-h-11 rounded-md border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-800 hover:bg-red-50">Initialize Lookup Tables</button>
           </div>
           <div class="bg-white border border-slate-200 rounded-lg p-4">
             <h3 class="text-sm font-semibold">Reset Transaction Tables</h3>
-            <p class="mt-1 text-sm text-slate-600">Would clear Receipt, ReceiptItem, and Payment. Waiting on a backend endpoint, so this button does not delete anything yet.</p>
+            <p class="mt-1 text-sm text-slate-600">Deletes ReceiptItem, Payment, and Receipt, then restores inventory quantities and bank balances to the seeded amounts. Lookup rows stay.</p>
             <button type="button" id="btn-reset-tx" class="mt-3 min-h-11 rounded-md border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-800 hover:bg-red-50">Reset Transaction Tables</button>
           </div>
         </div>
@@ -468,6 +468,9 @@
           <p id="admin-meta" class="text-sm text-slate-600"></p>
           <div id="admin-table" data-table></div>
         </div>
+
+        <p class="mt-2 text-sm text-slate-600"><strong>Note:</strong> Delete records from dependent tables before parent tables to avoid foreign key constraint errors.</p>
+        <p class="mt-1 text-sm text-slate-600"><strong>Suggested deletion order:</strong> ReceiptItem → Payment → Receipt → Inventory → BankAccount → Product → Store → StateTax.</p>
       </section>
     </main>
   </div>

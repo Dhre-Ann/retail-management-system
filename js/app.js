@@ -1031,7 +1031,7 @@ const App = (function () {
     if (blockIfSimRunning()) return;
     const ok = await UI.confirm({
       title: 'Initialize lookup tables?',
-      message: 'This runs the seed script. It inserts StateTax, Store, Product, Inventory, and BankAccount. It does not delete or replace rows that are already there. If a seed key already exists, the request fails and this run is rolled back. Receipt, ReceiptItem, and Payment are not changed.',
+      message: 'This runs the seed script. It inserts any missing StateTax, Store, Product, Inventory, and BankAccount rows. It does not delete or replace rows that are already there, including inventory quantities and bank balances. Receipt, ReceiptItem, and Payment are not changed. If a step fails, this run is rolled back.',
       confirmLabel: 'Run seed script'
     });
     if (!ok) return;
@@ -1050,10 +1050,22 @@ const App = (function () {
 
   async function onResetTransactions() {
     if (blockIfSimRunning()) return;
+    const ok = await UI.confirm({
+      title: 'Reset transaction tables?',
+      message: 'This deletes every ReceiptItem, Payment, and Receipt. Inventory quantities and bank account balances return to the seeded amounts. StateTax, Store, Product, Inventory, and BankAccount rows stay. If any step fails, the database rolls the whole reset back.',
+      confirmLabel: 'Reset transactions'
+    });
+    if (!ok) return;
+    const button = el('btn-reset-tx');
+    button.disabled = true;
     try {
-      await callApi(() => API.resetTransactionTables());
+      const result = await callApi(() => API.resetTransactionTables());
+      UI.toast(result.data.message, 'success');
+      await reloadReference();
     } catch (err) {
-      UI.toast(err.message || 'Reset transaction tables is not connected yet. Nothing was deleted.', 'info');
+      UI.toast(err.message || 'Reset transaction tables failed.', 'error');
+    } finally {
+      button.disabled = false;
     }
   }
 

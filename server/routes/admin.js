@@ -1,4 +1,4 @@
-// table creation, seed data, browsing, and deletion
+// table creation, seed data, transaction reset, browsing, and deletion
 
 const express = require('express');
 const fs = require('fs/promises');
@@ -42,6 +42,64 @@ router.post('/create-tables', async (req, res) => {
     }
 });
 
+// The seed inserts name these tables. Reset reuses the SELECT and VALUES
+// from those statements and ignores ON CONFLICT DO NOTHING.
+function extractSeedInsert(seedSql, qualifiedName) {
+    const escaped = qualifiedName.replace(/\./g, '\\.');
+    const match = seedSql.match(new RegExp(
+        `INSERT INTO ${escaped}\\s*\\([^)]*\\)\\s*([\\s\\S]*?)\\s*ON CONFLICT\\s+DO NOTHING\\s*;`,
+        'i'
+    ));
+
+    if (!match) {
+        throw new Error(`Seed file is missing an idempotent insert for ${qualifiedName}.`);
+    }
+
+    return match[1].trim();
+}
+
+// Inventory quantities and bank balances are defined in seed.sql.
+// Read those definitions instead of copying the numbers into this file.
+function buildResetStatements(seedSql) {
+    const inventorySelect = extractSeedInsert(seedSql, 'supermarkets.inventory');
+    const bankValues = extractSeedInsert(seedSql, 'banking.bankaccount');
+
+    if (!/^SELECT\b/i.test(inventorySelect)) {
+        throw new Error('Seed inventory insert must be a SELECT.');
+    }
+
+    if (!/^VALUES\b/i.test(bankValues)) {
+        throw new Error('Seed bank account insert must be a VALUES list.');
+    }
+
+    const restoreInventory = `
+        UPDATE supermarkets.inventory AS i
+        SET available_quantity = seeded.available_quantity
+        FROM (
+            SELECT store_id, sku, available_quantity
+            FROM (
+${inventorySelect}
+            ) AS generated(store_id, sku, available_quantity, aisle_number)
+        ) AS seeded
+        WHERE i.store_id = seeded.store_id
+          AND i.sku = seeded.sku
+    `;
+
+    const restoreBalances = `
+        UPDATE banking.bankaccount AS b
+        SET account_balance = seeded.account_balance
+        FROM (
+            SELECT account_id, account_balance
+            FROM (
+${bankValues}
+            ) AS generated(account_id, account_holder_name, account_number, account_balance)
+        ) AS seeded
+        WHERE b.account_id = seeded.account_id
+    `;
+
+    return { restoreInventory, restoreBalances };
+}
+
 // endpoint to initialize with seed data
 router.post('/initialize', async (req, res) => {
     const client = await pool.connect();
@@ -56,13 +114,50 @@ router.post('/initialize', async (req, res) => {
 
         res.json({
             status: 'success',
-            message: 'Database seeded successfully.'
+            message: 'Lookup tables initialized. Missing seed rows were inserted. Existing rows were left unchanged.'
         });
 
     } catch (error) {
         await client.query('ROLLBACK');
 
         console.error('Error seeding data:', error.message);
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+
+    } finally {
+        client.release();
+    }
+});
+
+// endpoint to clear receipts and restore seeded stock and balances
+router.post('/reset-transactions', async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const seedPath = path.join(sqlDir, 'seed.sql');
+        const seedSql = await fs.readFile(seedPath, 'utf8');
+        const { restoreInventory, restoreBalances } = buildResetStatements(seedSql);
+
+        await client.query('BEGIN');
+        await client.query('DELETE FROM supermarkets.receiptitem');
+        await client.query('DELETE FROM supermarkets.payment');
+        await client.query('DELETE FROM supermarkets.receipt');
+        await client.query(restoreInventory);
+        await client.query(restoreBalances);
+        await client.query('COMMIT');
+
+        res.json({
+            status: 'success',
+            message: 'Transaction tables reset. Receipt lines, payments, and receipts were deleted. Inventory quantities and bank balances were restored to the seeded values.'
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+
+        console.error('Error resetting transaction tables:', error.message);
 
         res.status(500).json({
             status: 'error',

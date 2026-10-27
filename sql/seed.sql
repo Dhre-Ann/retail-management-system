@@ -2,6 +2,8 @@
 -- Run AFTER schema.sql.
 --   StateTax -> Store -> Product -> Inventory -> BankAccount
 -- Receipt, ReceiptItem and Payment arent seeded; simulation makes them.
+-- ON CONFLICT DO NOTHING inserts missing rows and leaves existing rows,
+-- including sold quantities and spent balances, unchanged.
  
 -- 1. StateTax (first: Store.state references it). 
 INSERT INTO supermarkets.statetax (state, tax_rate) VALUES
@@ -14,7 +16,8 @@ INSERT INTO supermarkets.statetax (state, tax_rate) VALUES
   ('IL', 0.0875),
   ('WA', 0.1025),
   ('AZ', 0.084),
-  ('NC', 0.07);
+  ('NC', 0.07)
+ON CONFLICT DO NOTHING;
  
 -- 2. Store: 100 stores, 10 per state, aisle_count between 20 and 40
 INSERT INTO supermarkets.store (store_id, store_name, street_address, city, state, zip_code, aisle_count) VALUES
@@ -117,7 +120,8 @@ INSERT INTO supermarkets.store (store_id, store_name, street_address, city, stat
   (97, 'FreshMart Chicago #97', '989 Market St', 'Chicago', 'IL', '60686', 22),
   (98, 'FreshMart Seattle #98', '126 Lake Blvd', 'Seattle', 'WA', '98193', 27),
   (99, 'FreshMart Phoenix #99', '163 Park Ave', 'Phoenix', 'AZ', '85001', 32),
-  (100, 'FreshMart Charlotte #100', '200 Highland Rd', 'Charlotte', 'NC', '28208', 37);
+  (100, 'FreshMart Charlotte #100', '200 Highland Rd', 'Charlotte', 'NC', '28208', 37)
+ON CONFLICT DO NOTHING;
  
 -- 3. Product (unit_price is the base price; for weighted items it is price per lb)
 INSERT INTO supermarkets.product (sku, product_name, category, tax_treatment, unit_price, sold_by_weight, unit_of_measure) VALUES
@@ -135,7 +139,8 @@ INSERT INTO supermarkets.product (sku, product_name, category, tax_treatment, un
   ('CHP-402', 'Kettle Potato Chips', 'Snacks', 'taxable', 3.99, FALSE, 'each'),
   ('DEL-403', 'Rotisserie Chicken', 'Deli', 'taxable', 8.99, FALSE, 'each'),
   ('HHD-501', 'Dish Soap, 18 oz', 'Household', 'taxable', 2.79, FALSE, 'each'),
-  ('HHD-502', 'Paper Towels, 6 rolls', 'Household', 'taxable', 8.49, FALSE, 'each');
+  ('HHD-502', 'Paper Towels, 6 rolls', 'Household', 'taxable', 8.49, FALSE, 'each')
+ON CONFLICT DO NOTHING;
  
 -- 4. Inventory: every store stocks every product 
 INSERT INTO supermarkets.inventory (store_id, sku, available_quantity, aisle_number)
@@ -148,7 +153,8 @@ SELECT s.store_id,
                        WHEN 'Meat'    THEN 8  WHEN 'Beverages' THEN 10 WHEN 'Snacks' THEN 12
                        WHEN 'Deli'    THEN 14 ELSE 16 END
 FROM supermarkets.store s
-CROSS JOIN (SELECT sku, category, sold_by_weight, ROW_NUMBER() OVER (ORDER BY sku) AS rn FROM supermarkets.product) p;
+CROSS JOIN (SELECT sku, category, sold_by_weight, ROW_NUMBER() OVER (ORDER BY sku) AS rn FROM supermarkets.product) p
+ON CONFLICT DO NOTHING;
  
 -- 5. BankAccount (simulated): 20 accounts, some with small balances
 INSERT INTO banking.bankaccount (account_id, account_holder_name, account_number, account_balance) VALUES
@@ -171,7 +177,8 @@ INSERT INTO banking.bankaccount (account_id, account_holder_name, account_number
   (17, 'Amelia Scott', '1000069376', 45.00),
   (18, 'Jack Green', '1000073087', 820.00),
   (19, 'Harper Baker', '1000076798', 300.00),
-  (20, 'Owen Adams', '1000080509', 5.00);
+  (20, 'Owen Adams', '1000080509', 5.00)
+ON CONFLICT DO NOTHING;
  
 -- 
  

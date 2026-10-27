@@ -11,7 +11,7 @@
  *
  * Features that do not have a route yet throw instead of inventing rows.
  * Nothing in this file writes to the database except the functions that call
- * the existing create, seed, delete, checkout, and simulation routes.
+ * the existing create, seed, reset, delete, checkout, and simulation routes.
  */
 'use strict';
 
@@ -713,7 +713,7 @@ const API = (function () {
     const sql = [
       'POST /api/initialize',
       '-- Server reads sql/seed.sql and runs it in one transaction.',
-      '-- Existing primary keys are not replaced. A duplicate key rolls this run back.'
+      '-- Inserts use ON CONFLICT DO NOTHING, so existing rows are left unchanged.'
     ].join('\n');
     const { body, ms } = await request('POST', '/api/initialize', sql);
     const payload = expectMessage(body, 'Initialize', sql, ms);
@@ -725,7 +725,23 @@ const API = (function () {
   }
 
   async function resetTransactionTables() {
-    pending('Reset transaction tables is not connected to PostgreSQL yet. Nothing was deleted.');
+    const sql = [
+      'POST /api/reset-transactions',
+      'BEGIN;',
+      'DELETE FROM supermarkets.receiptitem;',
+      'DELETE FROM supermarkets.payment;',
+      'DELETE FROM supermarkets.receipt;',
+      '-- Restore supermarkets.inventory.available_quantity from the seed SELECT.',
+      '-- Restore banking.bankaccount.account_balance from the seed VALUES.',
+      'COMMIT;'
+    ].join('\n');
+    const { body, ms } = await request('POST', '/api/reset-transactions', sql);
+    const payload = expectMessage(body, 'Reset', sql, ms);
+    return {
+      data: { status: payload.status, message: payload.message },
+      sql,
+      ms
+    };
   }
 
   async function deleteAllRows(tableName) {
