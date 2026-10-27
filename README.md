@@ -1,96 +1,89 @@
 # Retail Management System
 
-A database-driven retail management application designed to simulate supermarket chain operations, including inventory management, state-specific product pricing, sales processing, payment validation, and reporting.
+**COSC 3380 | Group 16 | University of Houston**
 
-## Overview
+A supermarket management web application built with PostgreSQL, Node.js, Express, and JavaScript.
 
-The Retail Management System is a collaborative software project focused on designing and implementing a relational database and a web application for a multi-store supermarket chain.
+## Features
 
-The system models retail operations across multiple stores and states, supporting inventory tracking, product pricing, receipt generation, and payment processing. It also simulates checkout transactions, including bank balance validation and account balance updates for card payments.
-
-## Planned Features
-
-- **Multi-Store Management:** Maintain store information across multiple states.
-- **Inventory Management:** Track product availability and aisle locations at individual stores.
-- **State-Specific Pricing:** Maintain consistent product prices within each state while allowing prices to vary across states.
-- **Sales Processing:** Generate receipts containing individual product lines, quantities or weights, unit prices, and totals.
-- **Payment Processing:** Support cash and card payments, including simulated bank account balance validation and deductions.
-- **Sales and Inventory Reporting:** Use SQL queries, joins, and aggregate functions to retrieve meaningful operational insights.
-- **Checkout Simulation:** Automatically generate purchases using randomly selected products and process transactions.
-- **Database Operations:** Create, populate, query, and inspect database tables through the application.
-
-## Technology Stack
-
-- **Database:** PostgreSQL
-- **Backend:** JavaScript / Node.js
-- **Frontend:** HTML, CSS, and JavaScript
-- **Version Control:** Git and GitHub
-
-*The technology stack and features will be updated as implementation progresses.*
+- Manage inventory across 100 stores in 10 states.
+- Process cash and card purchases, including inventory updates and simulated bank transactions.
+- Generate receipts with itemized purchases, taxes, and totals.
+- Simulate multiple checkout transactions with configurable stores and concurrent connections.
+- Run SQL reports for sales, inventory, taxes, and payments.
+- Create, initialize, browse, and delete database records through the Admin interface.
 
 ## Database Design
 
-The preliminary data model includes the following entities:
+The database contains eight tables: `StateTax`, `Store`, `Product`, `Inventory`, `Receipt`, `ReceiptItem`, `Payment`, and `BankAccount`.
 
-| Entity | Purpose |
-|---|---|
-| `Store` | Stores supermarket location and state information. |
-| `Product` | Maintains product identifiers, names, categories, and tax treatment. |
-| `Inventory` | Tracks products stocked at each store, quantities, and aisle locations. |
-| `StateProductPrice` | Stores product prices by state. |
-| `Receipt` | Records individual sales transactions. |
-| `ReceiptItem` | Stores the products and quantities or weights associated with each receipt. |
-| `BankAccount` | Maintains simulated bank account information and balances. |
-| `Payment` | Records payment details and transaction status. |
+The schema uses primary keys, foreign keys, and PostgreSQL transactions to maintain data integrity.
 
-The database uses primary keys, foreign keys, and relationship constraints to maintain data integrity and represent relationships between stores, products, inventory, sales, and payments.
+**Documentation and SQL files:**
 
-## Transaction Processing
+- [Database Design and ER Diagram](docs/Group_16_documentation_phase_1.pdf)
+- [Database Schema](sql/schema.sql)
+- [Seed Data](sql/seed.sql)
+- [SQL Queries](sql/query.sql)
+- [Transaction SQL](sql/transaction.sql)
 
-For card purchases, the system is designed to validate the available account balance before processing payment. Related database changes, including receipt creation, payment recording, and bank balance updates, will be handled within a database transaction to maintain consistency.
+## Running the Application
 
-All account information and transactions used for testing are simulated. No real banking information is required.
+The database is the course PostgreSQL server. The app does not connect to it directly. An SSH tunnel forwards local port `5433` to PostgreSQL on the remote host, and `.env` points Node at that local port. The Express server only serves the API. The interface is `home.html` in the project root, opened as a file in the browser. That page calls `http://localhost:3000`.
 
-## Front-end UI draft
+You need Node.js and an SSH client. Windows Command Prompt already includes `ssh`.
 
-The screens in this repo are a front-end-only draft. Double-click `home.html` to open it in Chrome, Firefox, or Safari. An internet connection is required so the Tailwind CSS file can load from the CDN. There is no build step and no server yet.
+### First-time setup
 
-| File | Role |
-|---|---|
-| `home.html` | Layout: header, four sections, SQL log, toasts, confirmation modal |
-| `js/api.js` | Mock backend. The only file to edit when the real server is ready. |
-| `js/app.js` | Navigation, validation, and button wiring |
-| `js/ui.js` | Tables, toasts, the confirmation modal, and the SQL log |
+From the project root:
 
-Every button that would talk to the database calls a function in `js/api.js`. Each stub returns `{ data, sql, ms }` after a short delay. The SQL text is shown in the panel labeled "SQL Sent to Server".
+```bat
+npm install
+```
 
-The header **Demo Video** link is a placeholder (`https://example.com/freshmart-team16-demo`). Replace that `href` in `home.html` when the video is published. The **README** link points at this file.
+Create a `.env` file in the project root (it is gitignored). Use the course database password for `DB_PASSWORD`:
 
-Bank accounts and payments in the draft are simulated.
+```
+DB_USER=dbs16
+DB_HOST=localhost
+DB_NAME=dbs16
+DB_PASSWORD=your_course_password
+DB_PORT=5433
+```
 
-## Getting Started
+`DB_HOST` and `DB_PORT` must stay `localhost` and `5433`. Those values match the tunnel below, not the remote server's own port.
 
-Setup instructions will be added as the application and database implementation are completed.
+### Each time you run it
 
-The completed setup guide will cover:
+Use two Command Prompt windows. Leave both open while you use the app.
 
-1. Cloning the repository.
-2. Installing project dependencies.
-3. Configuring the PostgreSQL database.
-4. Creating and populating the database tables.
-5. Starting the application.
-6. Running checkout simulations and SQL reports.
+**1. Start the database tunnel**
+
+```bat
+ssh -N -L 5433:localhost:5432 dbs16@52.22.24.16
+```
+
+When SSH asks for a password, enter the same password as `DB_PASSWORD` in `.env`. `-N` keeps the window on the tunnel only; there is no remote shell. The window looks idle when the tunnel is up. Closing it drops the database connection.
+
+**2. Start the API**
+
+In a second window, from the `server` folder:
+
+```bat
+cd server
+node index.js
+```
+
+Wait until the console prints `Server is running on port 3000`. There is no `npm start` script.
+
+**3. Open the interface**
+
+Open `home.html` from the project root in a browser (double-click the file, or drag it into the browser). The page needs internet access so Tailwind and the fonts can load from their CDNs.
+
+`http://localhost:3000` is the API, not the page. A request to `/api/health` there should return a successful database connection if the tunnel and server are both running.
+
+The first time the database is empty, use **Admin / Database Tools** in the page to create and initialize the tables.
 
 ## Project Status
 
-**In Development**
-
-The project is being developed in stages, beginning with database design and schema implementation, followed by data population, SQL queries, transaction logic, frontend integration, and testing.
-
-## Contributors
-
-Developed collaboratively as a team software and database engineering project.
-
-## Disclaimer
-
-This application is intended for educational and demonstration purposes. Bank accounts, payments, and financial transactions are simulated and are not connected to real financial institutions.
+**Phase 1 complete.** Database design, checkout processing, simulation, reporting, and Admin operations are implemented.
