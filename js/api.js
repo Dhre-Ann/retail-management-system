@@ -11,7 +11,7 @@
  *
  * Features that do not have a route yet throw instead of inventing rows.
  * Nothing in this file writes to the database except the functions that call
- * the existing create, seed, delete, and checkout routes.
+ * the existing create, seed, delete, checkout, and simulation routes.
  */
 'use strict';
 
@@ -96,7 +96,7 @@ const API = (function () {
     return Number.isFinite(n) ? n : null;
   }
 
-  async function request(method, path, sql, payload) {
+  async function request(method, path, sql, payload, signal) {
     const started = performance.now();
     const headers = { Accept: 'application/json' };
     const options = { method, headers };
@@ -104,11 +104,21 @@ const API = (function () {
       headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(payload);
     }
+    if (signal) options.signal = signal;
     let response;
     try {
       response = await fetch(BASE + path, options);
     } catch (err) {
       const ms = Math.round(performance.now() - started);
+      if (err && err.name === 'AbortError') {
+        const aborted = fail(
+          'The page stopped waiting. The server can still finish this simulation.',
+          sql,
+          ms
+        );
+        aborted.name = 'AbortError';
+        throw aborted;
+      }
       throw fail(
         `Cannot reach the backend at ${BASE}. ${err && err.message ? err.message : 'Network error.'}`,
         sql,
@@ -740,12 +750,90 @@ const API = (function () {
     };
   }
 
-  async function runSimulation() {
-    pending('Simulation is not connected to PostgreSQL yet. No rows were written.');
+  function optionalNumber(value) {
+    if (value == null || value === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function simulationSql(payload) {
+    const lines = ['POST /api/simulate'];
+    lines.push('-- Request body:');
+    JSON.stringify(payload, null, 2).split('\n').forEach((line) => {
+      lines.push(`-- ${line}`);
+    });
+    lines.push('-- The endpoint does not return the SQL it executed.');
+    lines.push('-- It loads stocked products and bank accounts, then runs each');
+    lines.push('-- checkout through the existing checkout service.');
+    return lines.join('\n');
+  }
+
+  function simulationTransaction(row) {
+    const source = row && typeof row === 'object' ? row : {};
+    return {
+      transaction_number: optionalNumber(source.transaction_number),
+      store_id: optionalNumber(source.store_id),
+      payment_method: source.payment_method == null ? null : String(source.payment_method),
+      selection_count: optionalNumber(source.selection_count),
+      status: source.status == null ? '' : String(source.status),
+      receipt_id: optionalNumber(source.receipt_id),
+      total: optionalNumber(source.total),
+      execution_ms: optionalNumber(source.execution_ms),
+      message: source.message == null ? null : String(source.message)
+    };
+  }
+
+  function simulationResult(body, sql, ms) {
+    const summary = body && body.summary;
+    const transactions = body && body.transactions;
+    if (!summary || typeof summary !== 'object' || Array.isArray(summary) || !Array.isArray(transactions)) {
+      throw fail('Simulation returned an unexpected response.', sql, ms);
+    }
+    const normalized = {
+      requested: optionalNumber(summary.requested),
+      approved: optionalNumber(summary.approved),
+      declined: optionalNumber(summary.declined),
+      failed: optionalNumber(summary.failed),
+      total_sales: optionalNumber(summary.total_sales),
+      average_ms: optionalNumber(summary.average_ms),
+      min_ms: optionalNumber(summary.min_ms),
+      max_ms: optionalNumber(summary.max_ms),
+      total_elapsed_ms: optionalNumber(summary.total_elapsed_ms)
+    };
+    if (Object.keys(normalized).some((key) => normalized[key] == null)) {
+      throw fail('Simulation returned an unexpected summary.', sql, ms);
+    }
+    return {
+      summary: normalized,
+      transactions: transactions
+        .filter((row) => row && typeof row === 'object')
+        .map(simulationTransaction)
+    };
+  }
+
+  async function runSimulation(options, signal) {
+    const transactionCount = Number(options && options.transaction_count);
+    const concurrency = Number(options && options.concurrency);
+    const payload = {
+      transaction_count: transactionCount,
+      concurrency
+    };
+    const sql = simulationSql(payload);
+    if (!Number.isInteger(transactionCount) || transactionCount < 1 || transactionCount > 100) {
+      throw fail('Simulation did not start: transaction_count must be an integer from 1 to 100.', sql, 0);
+    }
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
+      throw fail('Simulation did not start: concurrency must be an integer from 1 to 10.', sql, 0);
+    }
+    if (concurrency > transactionCount) {
+      throw fail('Simulation did not start: concurrency cannot be greater than transaction_count.', sql, 0);
+    }
+    const { body, ms } = await request('POST', '/api/simulate', sql, payload, signal);
+    return { data: simulationResult(body, sql, ms), sql, ms };
   }
 
   async function getRecentActivity() {
-    pending('Recent activity is not connected to PostgreSQL yet. Nothing was queried.');
+    pending('Activity by time window is not available yet. Nothing was queried.');
   }
 
   return {

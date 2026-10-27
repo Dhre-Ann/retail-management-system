@@ -798,7 +798,7 @@ const App = (function () {
     state.simRunning = running;
     el('sim-run-btn').disabled = running;
     el('sim-run-btn').textContent = running ? 'Running…' : 'Run Simulation';
-    ['sim-customers', 'sim-stores', 'sim-concurrency'].forEach((id) => {
+    ['sim-customers', 'sim-concurrency'].forEach((id) => {
       el(id).disabled = running;
     });
     const stop = el('stop-btn');
@@ -824,6 +824,12 @@ const App = (function () {
     el('sim-revenue').textContent = UI.formatMoney(event.revenue || 0);
   }
 
+  function wholeNumber(raw) {
+    if (typeof raw === 'string' && raw.trim() === '') return null;
+    const n = Number(raw);
+    return Number.isInteger(n) ? n : null;
+  }
+
   function renderFeed() {
     const list = el('sim-feed');
     if (!state.feed.length) {
@@ -831,48 +837,56 @@ const App = (function () {
       return;
     }
     list.innerHTML = state.feed.map((item) => {
-      const bad = item.payment_status === 'declined' || item.payment_status === 'skipped';
-      let text;
-      if (item.payment_status === 'skipped') {
-        text = item.note || 'Skipped.';
-      } else {
-        const id = item.receipt_id == null ? 'no receipt' : `Receipt ${item.receipt_id}`;
-        text = `${id} · ${item.store_name || ''} · ${item.payment_method || ''} · ${item.payment_status} · ${UI.formatMoney(item.total_amount)}`;
-        if (item.payment_status === 'declined' && item.note) text += ` — ${item.note}`;
-      }
-      return `<li class="${bad ? 'text-red-700' : 'text-slate-700'}">${escapeHtml(text)}</li>`;
+      const parts = [
+        item.receipt_id == null ? 'Receipt id missing' : `Receipt ${item.receipt_id}`
+      ];
+      if (item.store_id != null) parts.push(`Store ${item.store_id}`);
+      if (item.payment_method) parts.push(item.payment_method);
+      if (item.status) parts.push(item.status);
+      if (item.total != null) parts.push(UI.formatMoney(item.total));
+      if (item.selection_count != null) parts.push(`${item.selection_count} selections`);
+      if (item.execution_ms != null) parts.push(`${item.execution_ms} ms`);
+      return `<li class="text-slate-700">${escapeHtml(parts.join(' · '))}</li>`;
     }).join('');
   }
 
-  function onSimProgress(event) {
-    if (event.sql) UI.logSql(event.sql, event.ms);
-    renderProgress(event);
-    el('sim-progress-label').textContent = 'Running';
-    if (event.last) {
-      state.feed.unshift(event.last);
-      state.feed = state.feed.slice(0, 8);
-      renderFeed();
-    }
+  function showSimulationResult(data) {
+    const summary = data.summary;
+    const transactions = Array.isArray(data.transactions) ? data.transactions : [];
+    renderProgress({
+      processed: summary.requested,
+      total: summary.requested,
+      receiptsCreated: summary.approved,
+      approved: summary.approved,
+      declined: summary.declined,
+      revenue: summary.total_sales
+    });
+    el('sim-progress-label').textContent = 'Finished';
+    el('sim-summary').textContent = `Finished. Elapsed time ${summary.total_elapsed_ms} ms. Average transaction time ${summary.average_ms} ms (min ${summary.min_ms} ms, max ${summary.max_ms} ms). Failed ${summary.failed}.`;
+    state.feed = transactions
+      .filter((item) => item.status === 'approved')
+      .slice()
+      .reverse();
+    renderFeed();
+    UI.toast(`Finished. Elapsed ${summary.total_elapsed_ms} ms. Average ${summary.average_ms} ms. Failed ${summary.failed}.`, 'success');
   }
 
   async function onRunSimulation(event) {
     event.preventDefault();
     UI.showError('sim-error', '');
     if (state.simRunning) return;
-    const customerCount = Number(el('sim-customers').value);
-    const storeCount = Number(el('sim-stores').value);
-    const concurrentConnections = Number(el('sim-concurrency').value);
-    const storeMax = Math.max(1, state.stores.length);
-    if (!isPositiveInt(customerCount) || customerCount > 1000) {
-      UI.showError('sim-error', 'Simulation did not start: number of customers must be a whole number from 1 to 1000.');
+    const transactionCount = wholeNumber(el('sim-customers').value);
+    const concurrency = wholeNumber(el('sim-concurrency').value);
+    if (transactionCount == null || transactionCount < 1 || transactionCount > 100) {
+      UI.showError('sim-error', 'Simulation did not start: customers / receipts must be a whole number from 1 to 100.');
       return;
     }
-    if (!isPositiveInt(storeCount) || storeCount > storeMax) {
-      UI.showError('sim-error', `Simulation did not start: number of stores must be a whole number from 1 to ${storeMax}.`);
+    if (concurrency == null || concurrency < 1 || concurrency > 10) {
+      UI.showError('sim-error', 'Simulation did not start: concurrent connections must be a whole number from 1 to 10.');
       return;
     }
-    if (!isPositiveInt(concurrentConnections) || concurrentConnections > 20) {
-      UI.showError('sim-error', 'Simulation did not start: concurrent connections must be a whole number from 1 to 20.');
+    if (concurrency > transactionCount) {
+      UI.showError('sim-error', 'Simulation did not start: concurrent connections cannot be greater than the number of customers / receipts.');
       return;
     }
     state.feed = [];
@@ -881,7 +895,7 @@ const App = (function () {
     el('sim-progress-label').textContent = 'Running';
     renderProgress({
       processed: 0,
-      total: customerCount,
+      total: transactionCount,
       receiptsCreated: 0,
       approved: 0,
       declined: 0,
@@ -891,23 +905,19 @@ const App = (function () {
     setSimRunning(true);
     try {
       const result = await callApi(() => API.runSimulation({
-        customerCount,
-        storeCount,
-        concurrentConnections
-      }, onSimProgress, state.simController.signal));
-      renderProgress({ ...result.data, total: customerCount });
-      const verb = result.data.cancelled ? 'Stopped early' : 'Finished';
-      el('sim-progress-label').textContent = result.data.cancelled ? 'Stopped' : 'Finished';
-      const skipped = result.data.skipped
-        ? ` Skipped ${result.data.skipped} because stock ran out.`
-        : '';
-      el('sim-summary').textContent = `${verb}. Elapsed time ${result.data.elapsedMs} ms. Average transaction time ${result.data.averageTransactionMs} ms.${skipped}`;
-      UI.toast(`${verb}. Elapsed ${result.data.elapsedMs} ms. Average transaction ${result.data.averageTransactionMs} ms.`, result.data.cancelled ? 'info' : 'success');
-      await reloadReference();
+        transaction_count: transactionCount,
+        concurrency
+      }, state.simController.signal));
+      showSimulationResult(result.data);
+      try {
+        await reloadReference();
+      } catch (err) {
+        UI.toast(err.message || 'Simulation finished, but the screen could not refresh store data.', 'error');
+      }
     } catch (err) {
       if (err && err.name === 'AbortError') {
         el('sim-progress-label').textContent = 'Stopped';
-        UI.toast('Simulation stopped.', 'info');
+        UI.toast('Stopped waiting. The server can still finish this simulation.', 'info');
       } else {
         el('sim-progress-label').textContent = 'Not run';
         UI.showError('sim-error', err.message || 'Simulation failed.');
@@ -925,7 +935,7 @@ const App = (function () {
       return;
     }
     state.simController.abort();
-    UI.toast('Stopping the simulation. Checkouts that already finished stay saved.', 'info');
+    UI.toast('Stopped waiting. The server can still finish this simulation.', 'info');
   }
 
   async function onActivity(event) {
