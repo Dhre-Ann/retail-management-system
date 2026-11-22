@@ -103,3 +103,23 @@ CREATE TABLE IF NOT EXISTS supermarkets.payment (
     FOREIGN KEY (account_id)
         REFERENCES banking.bankaccount(account_id)
 );
+
+-- Secondary indexes. PRIMARY KEY and UNIQUE already index those columns,
+-- and PostgreSQL does not index the referencing side of a foreign key.
+-- CREATE INDEX IF NOT EXISTS is safe on a populated database and on a
+-- second run of this file. These statements do not change rows.
+
+CREATE INDEX IF NOT EXISTS idx_store_state
+    ON supermarkets.store (state);
+
+CREATE INDEX IF NOT EXISTS idx_receipt_store_id
+    ON supermarkets.receipt (store_id);
+
+CREATE INDEX IF NOT EXISTS idx_receipt_datetime
+    ON supermarkets.receipt ((receipt_date + receipt_time));
+
+CREATE INDEX IF NOT EXISTS idx_receiptitem_sku
+    ON supermarkets.receiptitem (sku);
+
+CREATE INDEX IF NOT EXISTS idx_payment_account_id
+    ON supermarkets.payment (account_id);
