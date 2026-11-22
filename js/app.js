@@ -38,7 +38,9 @@ const App = (function () {
     feed: [],
     feedSource: '',
     simRunning: false,
-    simController: null
+    simController: null,
+    simRunId: null,
+    simStopping: false
   };
 
   let inventoryRequest = 0;
@@ -895,6 +897,7 @@ const App = (function () {
     const transactions = Array.isArray(data.transactions) ? data.transactions : [];
     const reasons = Array.isArray(summary.failure_reasons) ? summary.failure_reasons : [];
     const accounted = summary.approved + summary.declined + summary.failed;
+    const stopped = summary.stop_requested || summary.cancelled > 0;
     const reasonTotal = reasons.reduce((sum, row) => sum + row.count, 0);
     const approvedCents = transactions.reduce((sum, tx) => {
       if (tx.status !== 'approved') return sum;
@@ -904,7 +907,7 @@ const App = (function () {
     const revenueMismatch = Math.abs(Number(summary.total_sales) * 100 - approvedCents) > 0.5;
     renderProgress({
       processed: summary.attempted,
-      total: summary.attempted,
+      total: summary.requested,
       attempted: summary.attempted,
       completed: summary.completed,
       approved: summary.approved,
@@ -912,10 +915,13 @@ const App = (function () {
       failed: summary.failed,
       revenue: summary.total_sales
     });
-    el('sim-progress-label').textContent = 'Finished';
-    el('sim-summary').textContent = `Attempted ${summary.attempted}. Completed ${summary.completed}: approved ${summary.approved}, declined ${summary.declined}. Failed ${summary.failed}. Revenue ${UI.formatMoney(summary.total_sales)} from approved receipts only. Elapsed time ${summary.total_elapsed_ms} ms. Average transaction time ${summary.average_ms} ms (min ${summary.min_ms} ms, max ${summary.max_ms} ms).`;
+    el('sim-progress-label').textContent = stopped ? 'Stopped' : 'Finished';
+    const skippedText = stopped
+      ? ` Skipped after Stop ${summary.cancelled} of ${summary.requested} requested.`
+      : '';
+    el('sim-summary').textContent = `Attempted ${summary.attempted}. Completed ${summary.completed}: approved ${summary.approved}, declined ${summary.declined}. Failed ${summary.failed}.${skippedText} Revenue ${UI.formatMoney(summary.total_sales)} from approved receipts only. Elapsed time ${summary.total_elapsed_ms} ms. Average transaction time ${summary.average_ms} ms (min ${summary.min_ms} ms, max ${summary.max_ms} ms).`;
     renderFailures(reasons, true);
-    if (summary.requested !== summary.attempted
+    if (summary.requested !== summary.attempted + summary.cancelled
       || summary.attempted !== accounted
       || summary.completed !== summary.approved + summary.declined
       || reasonTotal !== summary.failed
@@ -928,7 +934,18 @@ const App = (function () {
       .slice()
       .reverse();
     renderFeed();
-    UI.toast(`Finished. Elapsed ${summary.total_elapsed_ms} ms. Average ${summary.average_ms} ms. Failed ${summary.failed}.`, 'success');
+    if (stopped) {
+      UI.toast(`Stopped. ${summary.attempted} checkouts ran and ${summary.cancelled} were skipped. Failed ${summary.failed}.`, 'info');
+    } else {
+      UI.toast(`Finished. Elapsed ${summary.total_elapsed_ms} ms. Average ${summary.average_ms} ms. Failed ${summary.failed}.`, 'success');
+    }
+  }
+
+  function newRunId() {
+    const cryptoApi = globalThis.crypto;
+    if (cryptoApi && typeof cryptoApi.randomUUID === 'function') return cryptoApi.randomUUID();
+    const random = Math.random().toString(36).slice(2, 12).padEnd(10, '0');
+    return `run-${Date.now().toString(36)}-${random}`;
   }
 
   async function onRunSimulation(event) {
@@ -982,12 +999,15 @@ const App = (function () {
       revenue: 0
     });
     state.simController = new AbortController();
+    state.simRunId = newRunId();
+    state.simStopping = false;
     setSimRunning(true);
     try {
       const result = await callApi(() => API.runSimulation({
         transaction_count: transactionCount,
         store_count: storeCount,
-        concurrency
+        concurrency,
+        run_id: state.simRunId
       }, state.simController.signal));
       showSimulationResult(result.data);
       try {
@@ -998,7 +1018,7 @@ const App = (function () {
     } catch (err) {
       if (err && err.name === 'AbortError') {
         el('sim-progress-label').textContent = 'Stopped';
-        UI.toast('Stopped waiting. The server can still finish this simulation.', 'info');
+        UI.toast('Stopped waiting. The server could not confirm the Stop, so it may finish this simulation.', 'info');
       } else {
         el('sim-progress-label').textContent = 'Not run';
         UI.showError('sim-error', err.message || 'Simulation failed.');
@@ -1013,17 +1033,38 @@ const App = (function () {
       }
     } finally {
       state.simController = null;
+      state.simRunId = null;
+      state.simStopping = false;
       setSimRunning(false);
     }
   }
 
-  function onStop() {
-    if (!state.simController) {
+  // Asks the server to stop this run, then keeps waiting for its final summary.
+  // Waiting is abandoned only if the server cannot take the Stop.
+  async function onStop() {
+    const controller = state.simController;
+    const runId = state.simRunId;
+    if (!controller || !runId) {
       UI.toast('Nothing is running to cancel.', 'info');
       return;
     }
-    state.simController.abort();
-    UI.toast('Stopped waiting. The server can still finish this simulation.', 'info');
+    if (state.simStopping) {
+      UI.toast('Stop was already requested. Waiting for running checkouts to finish.', 'info');
+      return;
+    }
+    state.simStopping = true;
+    el('sim-progress-label').textContent = 'Stopping';
+    try {
+      await callApi(() => API.cancelSimulation(runId));
+      if (state.simRunId === runId) {
+        UI.toast('Stop requested. No new checkouts will start. Checkouts already running will finish.', 'info');
+      }
+    } catch (err) {
+      if (state.simController === controller) {
+        controller.abort();
+        UI.toast(`${err.message || 'Stop failed.'} Stopped waiting instead.`, 'error');
+      }
+    }
   }
 
   function selectedReceiptInterval() {

@@ -35,7 +35,8 @@ const db = {
   stock: [],
   accounts: [],
   receipts: [],
-  checkoutMode: 'approve'
+  checkoutMode: 'approve',
+  pending: []
 };
 
 function stockedStore() {
@@ -121,6 +122,11 @@ require.cache[checkoutPath] = {
       db.checkouts.push(payload);
       db.events.push('checkout');
       const n = db.checkouts.length;
+      if (db.checkoutMode === 'deferred') {
+        return new Promise((resolve, reject) => {
+          db.pending.push({ n, resolve, reject });
+        });
+      }
       if (db.checkoutMode === 'mixed') {
         if (n === 1) return { saved: true, receipt_id: 9, total: 20 };
         if (n === 2) return { saved: false, message: 'Insufficient funds' };
@@ -149,6 +155,27 @@ function handlerFor(method, routePath) {
 
 const simulate = handlerFor('post', '/simulate');
 const recentReceipts = handlerFor('get', '/simulate/receipts');
+const cancelRun = handlerFor('post', '/simulate/:runId/cancel');
+
+async function until(predicate) {
+  for (let i = 0; i < 500; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error('timed out waiting for the simulation');
+}
+
+function cancel(runId) {
+  const res = mockRes();
+  cancelRun({ params: { runId } }, res);
+  return res;
+}
+
+function approvePending() {
+  const batch = db.pending.splice(0);
+  batch.forEach((entry) => entry.resolve({ saved: true, receipt_id: entry.n, total: 10 }));
+  return batch.length;
+}
 
 function mockRes() {
   return {
@@ -185,6 +212,7 @@ beforeEach(() => {
   db.failOn = null;
   db.receipts = [];
   db.checkoutMode = 'approve';
+  db.pending = [];
   readyDatabase();
 });
 
@@ -244,6 +272,8 @@ describe('simulation initialization', () => {
     assert.ok(checkoutAt > commitAt);
     assert.equal(res.body.summary.approved, 1);
     assert.equal(res.body.summary.failed, 0);
+    assert.equal(res.body.summary.cancelled, 0);
+    assert.equal(res.body.summary.stop_requested, false);
     assert.equal(res.body.summary.total_sales, 12.5);
     assert.deepEqual(res.body.summary.failure_reasons, []);
   });
@@ -335,6 +365,158 @@ describe('simulation initialization', () => {
     } finally {
       console.error = errorLog;
     }
+  });
+});
+
+describe('simulation stop', () => {
+  test('with 3 concurrent connections, Stop lets running checkouts finish and starts no more', async () => {
+    db.checkoutMode = 'deferred';
+    const errorLog = console.error;
+    console.error = () => {};
+    try {
+      const res = mockRes();
+      const running = simulate(requestBody({
+        run_id: 'run-concurrent-1',
+        transaction_count: 10,
+        concurrency: 3
+      }), res);
+
+      await until(() => db.pending.length === 3);
+      const first = cancel('run-concurrent-1');
+      const second = cancel('run-concurrent-1');
+      assert.equal(first.statusCode, 200);
+      assert.equal(first.body.state, 'stopping');
+      assert.equal(second.statusCode, 200);
+      assert.equal(second.body.state, 'already_stopping');
+
+      const inFlight = db.pending.splice(0);
+      inFlight[0].resolve({ saved: true, receipt_id: 1, total: 10 });
+      inFlight[1].resolve({ saved: false, message: 'Insufficient funds' });
+      inFlight[2].reject(new Error('Insufficient stock for SKU-0'));
+      await running;
+
+      assert.equal(res.statusCode, 200);
+      assert.equal(db.checkouts.length, 3);
+      assert.equal(db.pending.length, 0);
+      const summary = res.body.summary;
+      assert.equal(res.body.run_id, 'run-concurrent-1');
+      assert.equal(summary.requested, 10);
+      assert.equal(summary.attempted, 3);
+      assert.equal(summary.cancelled, 7);
+      assert.equal(summary.completed, 2);
+      assert.equal(summary.approved, 1);
+      assert.equal(summary.declined, 1);
+      assert.equal(summary.failed, 1);
+      assert.equal(summary.stop_requested, true);
+      assert.equal(summary.total_sales, 10);
+      assert.equal(summary.attempted + summary.cancelled, summary.requested);
+      assert.deepEqual(summary.failure_reasons, [
+        { message: 'Insufficient stock for SKU-0', count: 1 }
+      ]);
+      const skipped = res.body.transactions.filter((tx) => tx.status === 'cancelled');
+      assert.equal(skipped.length, 7);
+      assert.ok(skipped.every((tx) => tx.execution_ms === null && tx.receipt_id === null));
+      assert.ok(Number.isFinite(summary.average_ms));
+
+      const late = cancel('run-concurrent-1');
+      assert.equal(late.body.state, 'not_running');
+    } finally {
+      console.error = errorLog;
+    }
+  });
+
+  test('with 1 connection, Stop after the first checkout starts skips the rest', async () => {
+    db.checkoutMode = 'deferred';
+    const res = mockRes();
+    const running = simulate(requestBody({
+      run_id: 'run-single-01',
+      transaction_count: 5,
+      concurrency: 1
+    }), res);
+
+    await until(() => db.pending.length === 1);
+    cancel('run-single-01');
+    approvePending();
+    await running;
+
+    assert.equal(db.checkouts.length, 1);
+    assert.equal(res.body.summary.attempted, 1);
+    assert.equal(res.body.summary.approved, 1);
+    assert.equal(res.body.summary.cancelled, 4);
+  });
+
+  test('Stop affects only the run it names', async () => {
+    db.checkoutMode = 'deferred';
+    const resA = mockRes();
+    const resB = mockRes();
+    let finished = 0;
+    const runA = simulate(requestBody({
+      run_id: 'run-target-A',
+      transaction_count: 6,
+      concurrency: 2
+    }), resA).then(() => { finished += 1; });
+    const runB = simulate(requestBody({
+      run_id: 'run-other-B',
+      transaction_count: 6,
+      concurrency: 2
+    }), resB).then(() => { finished += 1; });
+
+    await until(() => db.pending.length === 4);
+    cancel('run-target-A');
+    while (finished < 2) {
+      approvePending();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    await Promise.all([runA, runB]);
+
+    assert.equal(resA.body.summary.attempted, 2);
+    assert.equal(resA.body.summary.cancelled, 4);
+    assert.equal(resA.body.summary.stop_requested, true);
+    assert.equal(resB.body.summary.attempted, 6);
+    assert.equal(resB.body.summary.cancelled, 0);
+    assert.equal(resB.body.summary.stop_requested, false);
+    assert.equal(db.checkouts.length, 8);
+  });
+
+  test('a Stop that arrives before the run request starts no checkouts', async () => {
+    const early = cancel('run-early-01');
+    assert.equal(early.statusCode, 200);
+    assert.equal(early.body.state, 'not_running');
+
+    const res = mockRes();
+    await simulate(requestBody({
+      run_id: 'run-early-01',
+      transaction_count: 4,
+      concurrency: 2
+    }), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(db.checkouts.length, 0);
+    assert.equal(res.body.summary.attempted, 0);
+    assert.equal(res.body.summary.cancelled, 4);
+    assert.equal(res.body.summary.total_sales, 0);
+    assert.ok(db.queries.includes('COMMIT'));
+  });
+
+  test('rejects bad run ids and a second run with an active id', async () => {
+    assert.equal(cancel('bad id!').statusCode, 400);
+
+    const badRun = mockRes();
+    await simulate(requestBody({ run_id: 'x' }), badRun);
+    assert.equal(badRun.statusCode, 400);
+    assert.equal(db.checkouts.length, 0);
+
+    db.checkoutMode = 'deferred';
+    const first = mockRes();
+    const running = simulate(requestBody({ run_id: 'run-dupe-01' }), first);
+    await until(() => db.pending.length === 1);
+    const dupe = mockRes();
+    await simulate(requestBody({ run_id: 'run-dupe-01' }), dupe);
+    assert.equal(dupe.statusCode, 409);
+    approvePending();
+    await running;
+    assert.equal(first.statusCode, 200);
+    assert.equal(db.checkouts.length, 1);
   });
 });
 

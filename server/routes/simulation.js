@@ -1,6 +1,7 @@
 // automated checkout simulation
 // one catalog snapshot, then processCheckout on a bounded worker pool
 
+const crypto = require('crypto');
 const express = require('express');
 const pool = require('../db/pool');
 const { processCheckout } = require('../services/checkoutService');
@@ -15,6 +16,29 @@ const MAX_ITEMS = 20;
 const MIN_WEIGHT_CENTS = 25;
 const MAX_WEIGHT_CENTS = 150;
 const RECENT_RECEIPT_LIMIT = 100;
+const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+const EARLY_CANCEL_TTL_MS = 5 * 60 * 1000;
+const EARLY_CANCEL_LIMIT = 1000;
+
+// runId -> { cancelled }. Workers read the flag before taking another checkout.
+const activeRuns = new Map();
+// A Stop can reach the server before its run request does. Remember it briefly.
+const earlyCancels = new Map();
+
+function pruneEarlyCancels(now) {
+    for (const [runId, at] of earlyCancels) {
+        if (now - at > EARLY_CANCEL_TTL_MS || earlyCancels.size > EARLY_CANCEL_LIMIT) {
+            earlyCancels.delete(runId);
+        }
+    }
+}
+
+function takeEarlyCancel(runId) {
+    pruneEarlyCancels(Date.now());
+    const found = earlyCancels.has(runId);
+    earlyCancels.delete(runId);
+    return found;
+}
 
 // Whitelisted intervals. The SQL value is a bound parameter, never concatenated.
 const RECEIPT_INTERVALS = {
@@ -81,10 +105,18 @@ function parseSimulationRequest(body) {
         };
     }
 
+    if (body.run_id !== undefined &&
+        (typeof body.run_id !== 'string' || !RUN_ID_PATTERN.test(body.run_id))) {
+        return {
+            error: 'run_id must be 8 to 64 letters, digits, hyphens, or underscores'
+        };
+    }
+
     return {
         transactionCount: transactionCount.value,
         concurrency: concurrency.value,
-        storeCount: body.store_count
+        storeCount: body.store_count,
+        runId: body.run_id
     };
 }
 
@@ -449,13 +481,28 @@ async function executePurchase(transactionNumber, stores, accountIds, storeId) {
     }
 }
 
-// each worker finishes one checkout before taking another index
-async function runTransactions(transactionCount, concurrency, stores, accountIds, assignments) {
+function cancelledResult(transactionNumber, storeId) {
+    return {
+        transaction_number: transactionNumber,
+        store_id: Number.isInteger(storeId) ? storeId : null,
+        payment_method: null,
+        selection_count: 0,
+        status: 'cancelled',
+        receipt_id: null,
+        total: null,
+        execution_ms: null,
+        message: 'Not started because the simulation was stopped'
+    };
+}
+
+// each worker finishes one checkout before taking another index.
+// After Stop, no worker takes a new index; checkouts already started finish normally.
+async function runTransactions(transactionCount, concurrency, stores, accountIds, assignments, run) {
     const results = new Array(transactionCount);
     let nextIndex = 0;
 
     async function worker() {
-        while (nextIndex < transactionCount) {
+        while (nextIndex < transactionCount && !(run && run.cancelled)) {
             const index = nextIndex;
             nextIndex += 1;
             const started = performance.now();
@@ -485,6 +532,13 @@ async function runTransactions(transactionCount, concurrency, stores, accountIds
     }
 
     await Promise.all(workers);
+
+    for (let i = 0; i < transactionCount; i += 1) {
+        if (!results[i]) {
+            results[i] = cancelledResult(i + 1, assignments[i]);
+        }
+    }
+
     return results;
 }
 
@@ -503,16 +557,23 @@ function failureReasons(transactions) {
         .sort((a, b) => b.count - a.count || a.message.localeCompare(b.message));
 }
 
-function summarize(requested, transactions, totalElapsedMs) {
+function summarize(requested, transactions, totalElapsedMs, stopRequested = false) {
     let approved = 0;
     let declined = 0;
     let failed = 0;
+    let cancelled = 0;
     let salesCents = 0;
     let sumMs = 0;
     let minMs = Infinity;
     let maxMs = -Infinity;
 
     for (const tx of transactions) {
+        // never started, so it has no timing and no revenue
+        if (tx.status === 'cancelled') {
+            cancelled += 1;
+            continue;
+        }
+
         // Revenue is approved receipts only. Declined and failed totals are ignored.
         if (tx.status === 'approved') {
             approved += 1;
@@ -534,7 +595,7 @@ function summarize(requested, transactions, totalElapsedMs) {
         }
     }
 
-    const attempted = transactions.length;
+    const attempted = transactions.length - cancelled;
     const completed = approved + declined;
 
     return {
@@ -544,6 +605,8 @@ function summarize(requested, transactions, totalElapsedMs) {
         approved,
         declined,
         failed,
+        cancelled,
+        stop_requested: Boolean(stopRequested),
         failure_reasons: failureReasons(transactions),
         total_sales: salesCents / 100,
         average_ms: attempted ? roundMs(sumMs / attempted) : 0,
@@ -641,6 +704,40 @@ router.get('/simulate/receipts', async (req, res) => {
     }
 });
 
+// Stop for one run. Repeated calls are safe and change nothing after the first.
+router.post('/simulate/:runId/cancel', (req, res) => {
+    const { runId } = req.params;
+
+    if (!RUN_ID_PATTERN.test(runId)) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Invalid simulation run id'
+        });
+    }
+
+    const run = activeRuns.get(runId);
+
+    if (!run) {
+        earlyCancels.set(runId, Date.now());
+        pruneEarlyCancels(Date.now());
+        return res.json({
+            status: 'success',
+            state: 'not_running',
+            message: 'No running simulation has this id. If it starts, it will not run any checkouts.'
+        });
+    }
+
+    const already = run.cancelled;
+    run.cancelled = true;
+    res.json({
+        status: 'success',
+        state: already ? 'already_stopping' : 'stopping',
+        message: already
+            ? 'Stop was already requested for this simulation.'
+            : 'Stop requested. No new checkouts will start. Checkouts already running will finish.'
+    });
+});
+
 router.post('/simulate', async (req, res) => {
     const parsed = parseSimulationRequest(req.body);
 
@@ -651,6 +748,27 @@ router.post('/simulate', async (req, res) => {
         });
     }
 
+    const runId = parsed.runId || crypto.randomUUID();
+
+    if (activeRuns.has(runId)) {
+        return res.status(409).json({
+            status: 'error',
+            message: 'A simulation with this run id is already running.'
+        });
+    }
+
+    // registered before setup so a Stop during initialization is not lost
+    const run = { cancelled: takeEarlyCancel(runId) };
+    activeRuns.set(runId, run);
+
+    try {
+        await runSimulation(parsed, runId, run, res);
+    } finally {
+        activeRuns.delete(runId);
+    }
+});
+
+async function runSimulation(parsed, runId, run, res) {
     try {
         await ensureSimulationDatabase();
     } catch (error) {
@@ -683,14 +801,17 @@ router.post('/simulate', async (req, res) => {
             parsed.concurrency,
             catalog.stores,
             catalog.accountIds,
-            assignments
+            assignments,
+            run
         );
 
         res.json({
+            run_id: runId,
             summary: summarize(
                 parsed.transactionCount,
                 transactions,
-                performance.now() - started
+                performance.now() - started,
+                run.cancelled
             ),
             transactions
         });
@@ -701,7 +822,7 @@ router.post('/simulate', async (req, res) => {
             message: 'Unable to run simulation'
         });
     }
-});
+}
 
 module.exports = router;
 module.exports.summarize = summarize;

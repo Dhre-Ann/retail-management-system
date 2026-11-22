@@ -785,8 +785,12 @@ const API = (function () {
     lines.push('-- and bank balances are left unchanged.');
     lines.push('-- Checkouts start only after that transaction commits.');
     lines.push('-- Each checkout goes through the existing checkout service.');
+    lines.push('-- Stop sends POST /api/simulate/<run_id>/cancel. No new checkouts start');
+    lines.push('-- after that; checkouts already in a transaction commit or roll back.');
     return lines.join('\n');
   }
+
+  const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
 
   function simulationTransaction(row) {
     const source = row && typeof row === 'object' ? row : {};
@@ -840,6 +844,7 @@ const API = (function () {
       approved: optionalNumber(summary.approved),
       declined: optionalNumber(summary.declined),
       failed: optionalNumber(summary.failed),
+      cancelled: optionalNumber(summary.cancelled),
       total_sales: optionalNumber(summary.total_sales),
       average_ms: optionalNumber(summary.average_ms),
       min_ms: optionalNumber(summary.min_ms),
@@ -854,7 +859,9 @@ const API = (function () {
       .map(simulationTransaction);
     normalized.failure_reasons = normalizeFailureReasons(summary.failure_reasons)
       || deriveFailureReasons(mapped);
+    normalized.stop_requested = summary.stop_requested === true;
     return {
+      run_id: body.run_id == null ? null : String(body.run_id),
       summary: normalized,
       transactions: mapped
     };
@@ -869,7 +876,11 @@ const API = (function () {
       store_count: storeCount,
       concurrency
     };
+    if (options && options.run_id != null) payload.run_id = String(options.run_id);
     const sql = simulationSql(payload);
+    if (payload.run_id != null && !RUN_ID_PATTERN.test(payload.run_id)) {
+      throw fail('Simulation did not start: run_id must be 8 to 64 letters, digits, hyphens, or underscores.', sql, 0);
+    }
     if (!Number.isInteger(transactionCount) || transactionCount < 1 || transactionCount > 100) {
       throw fail('Simulation did not start: transaction_count must be an integer from 1 to 100.', sql, 0);
     }
@@ -887,6 +898,29 @@ const API = (function () {
     }
     const { body, ms } = await request('POST', '/api/simulate', sql, payload, signal);
     return { data: simulationResult(body, sql, ms), sql, ms };
+  }
+
+  async function cancelSimulation(runId) {
+    const id = runId == null ? '' : String(runId);
+    const sql = [
+      `POST /api/simulate/${id}/cancel`,
+      '-- No SQL runs. The server stops starting new checkouts for this run.',
+      '-- Checkouts already inside a transaction commit or roll back as usual.',
+      '-- Committed receipts are not deleted.'
+    ].join('\n');
+    if (!RUN_ID_PATTERN.test(id)) {
+      throw fail('Stop failed: this simulation does not have a valid run id.', sql, 0);
+    }
+    const { body, ms } = await request('POST', `/api/simulate/${encodeURIComponent(id)}/cancel`, sql);
+    const payload = expectMessage(body, 'Stop', sql, ms);
+    return {
+      data: {
+        state: payload.state == null ? '' : String(payload.state),
+        message: payload.message
+      },
+      sql,
+      ms
+    };
   }
 
   const RECEIPT_INTERVALS = {
@@ -969,6 +1003,7 @@ const API = (function () {
     resetTransactionTables,
     deleteAllRows,
     runSimulation,
+    cancelSimulation,
     getRecentReceipts
   };
 })();
