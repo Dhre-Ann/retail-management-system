@@ -36,6 +36,7 @@ const App = (function () {
     reportId: '',
     reportReady: false,
     feed: [],
+    feedSource: '',
     simRunning: false,
     simController: null
   };
@@ -70,11 +71,6 @@ const App = (function () {
   function localDateInput(date) {
     const pad = (n) => String(n).padStart(2, '0');
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-  }
-
-  function localDateTimeInput(date) {
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${localDateInput(date)}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
   function isPositiveInt(value) {
@@ -819,9 +815,11 @@ const App = (function () {
     el('sim-progress-bar').style.width = `${pct}%`;
     el('sim-progress').setAttribute('aria-valuenow', String(pct));
     el('sim-progress-count').textContent = total ? `${processed} / ${total}` : '';
-    el('sim-created').textContent = String(event.receiptsCreated || 0);
+    el('sim-attempted').textContent = String(event.attempted || 0);
+    el('sim-completed').textContent = String(event.completed || 0);
     el('sim-approved').textContent = String(event.approved || 0);
     el('sim-declined').textContent = String(event.declined || 0);
+    el('sim-failed').textContent = String(event.failed || 0);
     el('sim-revenue').textContent = UI.formatMoney(event.revenue || 0);
   }
 
@@ -838,39 +836,93 @@ const App = (function () {
     return Number.isInteger(n) ? n : null;
   }
 
+  function renderFailures(reasons, finished) {
+    const list = el('sim-failures');
+    if (!finished) {
+      list.innerHTML = '<li>Failure reasons appear here after a run.</li>';
+      return;
+    }
+    if (!reasons.length) {
+      list.innerHTML = '<li>No checkout failures.</li>';
+      return;
+    }
+    list.innerHTML = reasons.map((row) => (
+      `<li class="break-words text-slate-700">${escapeHtml(row.message)} <span class="font-medium">(${row.count})</span></li>`
+    )).join('');
+  }
+
   function renderFeed() {
     const list = el('sim-feed');
     if (!state.feed.length) {
-      list.innerHTML = '<li>No receipts yet.</li>';
+      list.innerHTML = state.feedSource === 'window'
+        ? '<li>No receipts in this interval.</li>'
+        : '<li>No receipts yet.</li>';
       return;
     }
     list.innerHTML = state.feed.map((item) => {
       const parts = [
         item.receipt_id == null ? 'Receipt id missing' : `Receipt ${item.receipt_id}`
       ];
-      if (item.store_id != null) parts.push(`Store ${item.store_id}`);
+      if (item.store_id != null && item.store_name) {
+        parts.push(`Store ${item.store_id} (${item.store_name})`);
+      } else if (item.store_name) {
+        parts.push(item.store_name);
+      } else if (item.store_id != null) {
+        parts.push(`Store ${item.store_id}`);
+      }
+      if (item.receipt_date) {
+        parts.push(`${item.receipt_date}${item.receipt_time ? ` ${item.receipt_time}` : ''}`);
+      }
       if (item.payment_method) parts.push(item.payment_method);
       if (item.status) parts.push(item.status);
-      if (item.total != null) parts.push(UI.formatMoney(item.total));
+      if (item.subtotal != null) parts.push(`subtotal ${UI.formatMoney(item.subtotal)}`);
+      if (item.tax_amount != null) parts.push(`tax ${UI.formatMoney(item.tax_amount)}`);
+      if (item.total != null) parts.push(`total ${UI.formatMoney(item.total)}`);
       if (item.selection_count != null) parts.push(`${item.selection_count} selections`);
       if (item.execution_ms != null) parts.push(`${item.execution_ms} ms`);
-      return `<li class="text-slate-700">${escapeHtml(parts.join(' · '))}</li>`;
+      return `<li class="break-words text-slate-700">${escapeHtml(parts.join(' · '))}</li>`;
     }).join('');
+  }
+
+  function moneyCents(value) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return null;
+    return Math.round(amount * 100);
   }
 
   function showSimulationResult(data) {
     const summary = data.summary;
     const transactions = Array.isArray(data.transactions) ? data.transactions : [];
+    const reasons = Array.isArray(summary.failure_reasons) ? summary.failure_reasons : [];
+    const accounted = summary.approved + summary.declined + summary.failed;
+    const reasonTotal = reasons.reduce((sum, row) => sum + row.count, 0);
+    const approvedCents = transactions.reduce((sum, tx) => {
+      if (tx.status !== 'approved') return sum;
+      const cents = moneyCents(tx.total);
+      return cents == null ? sum : sum + cents;
+    }, 0);
+    const revenueMismatch = Math.abs(Number(summary.total_sales) * 100 - approvedCents) > 0.5;
     renderProgress({
-      processed: summary.requested,
-      total: summary.requested,
-      receiptsCreated: summary.approved,
+      processed: summary.attempted,
+      total: summary.attempted,
+      attempted: summary.attempted,
+      completed: summary.completed,
       approved: summary.approved,
       declined: summary.declined,
+      failed: summary.failed,
       revenue: summary.total_sales
     });
     el('sim-progress-label').textContent = 'Finished';
-    el('sim-summary').textContent = `Finished. Elapsed time ${summary.total_elapsed_ms} ms. Average transaction time ${summary.average_ms} ms (min ${summary.min_ms} ms, max ${summary.max_ms} ms). Failed ${summary.failed}.`;
+    el('sim-summary').textContent = `Attempted ${summary.attempted}. Completed ${summary.completed}: approved ${summary.approved}, declined ${summary.declined}. Failed ${summary.failed}. Revenue ${UI.formatMoney(summary.total_sales)} from approved receipts only. Elapsed time ${summary.total_elapsed_ms} ms. Average transaction time ${summary.average_ms} ms (min ${summary.min_ms} ms, max ${summary.max_ms} ms).`;
+    renderFailures(reasons, true);
+    if (summary.requested !== summary.attempted
+      || summary.attempted !== accounted
+      || summary.completed !== summary.approved + summary.declined
+      || reasonTotal !== summary.failed
+      || revenueMismatch) {
+      UI.showError('sim-error', `Simulation finished, but the result counts are inconsistent. Attempted ${summary.attempted}, completed ${summary.completed}, approved ${summary.approved}, declined ${summary.declined}, failed ${summary.failed}.`);
+    }
+    state.feedSource = 'run';
     state.feed = transactions
       .filter((item) => item.status === 'approved')
       .slice()
@@ -891,11 +943,11 @@ const App = (function () {
       UI.showError('sim-error', 'Simulation did not start: customers / receipts must be a whole number from 1 to 100.');
       return;
     }
-    if (storeMax < 1) {
-      UI.showError('sim-error', 'Simulation did not start: the store list has not loaded, so stores involved cannot be checked.');
+    if (storeCount == null || storeCount < 1) {
+      UI.showError('sim-error', 'Simulation did not start: stores involved must be a whole number of at least 1.');
       return;
     }
-    if (storeCount == null || storeCount < 1 || storeCount > storeMax) {
+    if (storeMax >= 1 && storeCount > storeMax) {
       UI.showError('sim-error', `Simulation did not start: stores involved must be a whole number from 1 to ${storeMax}.`);
       return;
     }
@@ -912,15 +964,21 @@ const App = (function () {
       return;
     }
     state.feed = [];
+    state.feedSource = '';
     renderFeed();
+    renderFailures([], false);
+    el('sim-feed-meta').textContent = '';
+    UI.showError('receipt-window-error', '');
     el('sim-summary').textContent = '';
     el('sim-progress-label').textContent = 'Running';
     renderProgress({
       processed: 0,
       total: transactionCount,
-      receiptsCreated: 0,
+      attempted: 0,
+      completed: 0,
       approved: 0,
       declined: 0,
+      failed: 0,
       revenue: 0
     });
     state.simController = new AbortController();
@@ -945,6 +1003,13 @@ const App = (function () {
         el('sim-progress-label').textContent = 'Not run';
         UI.showError('sim-error', err.message || 'Simulation failed.');
         UI.toast(err.message || 'Simulation failed.', 'error');
+        if (!String(err.message || '').startsWith('Cannot reach')) {
+          try {
+            await reloadReference();
+          } catch (reloadErr) {
+            // The simulation error is already on screen.
+          }
+        }
       }
     } finally {
       state.simController = null;
@@ -961,41 +1026,45 @@ const App = (function () {
     UI.toast('Stopped waiting. The server can still finish this simulation.', 'info');
   }
 
-  async function onActivity(event) {
-    event.preventDefault();
-    UI.showError('activity-error', '');
-    const preset = document.querySelector('input[name="activity-preset"]:checked').value;
-    const range = { preset };
-    if (preset === 'custom') {
-      range.start = el('activity-start').value;
-      range.end = el('activity-end').value;
-      if (!range.start || !range.end) {
-        UI.showError('activity-error', 'Recent activity failed before the server call: choose both a start and an end.');
-        return;
-      }
-      if (range.start > range.end) {
-        UI.showError('activity-error', 'Recent activity failed before the server call: the start is after the end.');
-        return;
-      }
+  function selectedReceiptInterval() {
+    if (typeof document.querySelector === 'function') {
+      const checked = document.querySelector('input[name="receipt-interval"]:checked');
+      if (checked && checked.value) return checked.value;
     }
+    return '5min';
+  }
+
+  async function loadRecentReceipts() {
+    UI.showError('receipt-window-error', '');
+    const interval = selectedReceiptInterval();
+    const result = await callApi(() => API.getRecentReceipts(interval));
+    const rows = result.data.rows || [];
+    state.feedSource = 'window';
+    state.feed = rows.map((row) => ({
+      receipt_id: row.receipt_id,
+      store_id: row.store_id,
+      store_name: row.store_name,
+      receipt_date: row.receipt_date,
+      receipt_time: row.receipt_time,
+      payment_method: row.payment_method,
+      status: row.payment_status,
+      subtotal: row.subtotal,
+      tax_amount: row.tax_amount,
+      total: row.total_amount
+    }));
+    renderFeed();
+    const noun = rows.length === 1 ? 'receipt' : 'receipts';
+    const extra = result.data.truncated ? ' Showing the 100 most recent.' : '';
+    el('sim-feed-meta').textContent = `${rows.length} ${noun} in the last ${result.data.label}.${extra} Query ${result.ms} ms.`;
+  }
+
+  async function onReceiptWindow(event) {
+    event.preventDefault();
     try {
-      const result = await callApi(() => API.getRecentActivity(range));
-      const rows = result.data.rows || [];
-      el('activity-meta').textContent = `Query ${result.ms} ms · ${new Date(result.data.start).toLocaleString()} to ${new Date(result.data.end).toLocaleString()}`;
-      UI.renderTable(el('activity-table'), {
-        columns: [
-          { key: 'at_ms', label: 'When', format: UI.formatWhen },
-          { key: 'table', label: 'Table' },
-          { key: 'action', label: 'Action' },
-          { key: 'record', label: 'Record' },
-          { key: 'detail', label: 'Details' }
-        ],
-        rows,
-        emptyMessage: 'No rows were inserted or updated in this interval.'
-      });
+      await loadRecentReceipts();
     } catch (err) {
-      UI.showError('activity-error', err.message || 'Recent activity failed.');
-      UI.toast(err.message || 'Recent activity failed.', 'error');
+      UI.showError('receipt-window-error', err.message || 'Recent receipts failed.');
+      UI.toast(err.message || 'Recent receipts failed.', 'error');
     }
   }
 
@@ -1213,19 +1282,7 @@ const App = (function () {
     });
 
     el('sim-form').addEventListener('submit', onRunSimulation);
-    document.querySelectorAll('input[name="activity-preset"]').forEach((radio) => {
-      radio.addEventListener('change', () => {
-        const custom = document.querySelector('input[name="activity-preset"]:checked').value === 'custom';
-        el('activity-custom').classList.toggle('hidden', !custom);
-        if (custom && !el('activity-start').value) {
-          const end = new Date();
-          const start = new Date(Date.now() - 60 * 60 * 1000);
-          el('activity-start').value = localDateTimeInput(start);
-          el('activity-end').value = localDateTimeInput(end);
-        }
-      });
-    });
-    el('activity-form').addEventListener('submit', onActivity);
+    el('receipt-window-form').addEventListener('submit', onReceiptWindow);
 
     el('btn-create-tables').addEventListener('click', onCreateTables);
     el('btn-init-lookups').addEventListener('click', onInitLookups);

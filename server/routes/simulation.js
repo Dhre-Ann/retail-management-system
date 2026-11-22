@@ -4,6 +4,7 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { processCheckout } = require('../services/checkoutService');
+const { ensureSimulationDatabase } = require('../services/databaseInit');
 
 const router = express.Router();
 
@@ -13,6 +14,15 @@ const MIN_ITEMS = 10;
 const MAX_ITEMS = 20;
 const MIN_WEIGHT_CENTS = 25;
 const MAX_WEIGHT_CENTS = 150;
+const RECENT_RECEIPT_LIMIT = 100;
+
+// Whitelisted intervals. The SQL value is a bound parameter, never concatenated.
+const RECEIPT_INTERVALS = {
+    '5min': { label: '5 minutes', sql: '5 minutes' },
+    '15min': { label: '15 minutes', sql: '15 minutes' },
+    '1hour': { label: '1 hour', sql: '1 hour' },
+    '24hour': { label: '24 hours', sql: '24 hours' }
+};
 
 function parseBoundedInteger(value, fallback, min, max, name) {
     if (value === undefined) {
@@ -478,6 +488,21 @@ async function runTransactions(transactionCount, concurrency, stores, accountIds
     return results;
 }
 
+function failureReasons(transactions) {
+    const counts = new Map();
+
+    for (const tx of transactions) {
+        if (tx.status !== 'failed') {
+            continue;
+        }
+        const message = tx.message || 'Checkout failed';
+        counts.set(message, (counts.get(message) || 0) + 1);
+    }
+
+    return Array.from(counts, ([message, count]) => ({ message, count }))
+        .sort((a, b) => b.count - a.count || a.message.localeCompare(b.message));
+}
+
 function summarize(requested, transactions, totalElapsedMs) {
     let approved = 0;
     let declined = 0;
@@ -488,6 +513,7 @@ function summarize(requested, transactions, totalElapsedMs) {
     let maxMs = -Infinity;
 
     for (const tx of transactions) {
+        // Revenue is approved receipts only. Declined and failed totals are ignored.
         if (tx.status === 'approved') {
             approved += 1;
             if (Number.isFinite(tx.total)) {
@@ -508,18 +534,37 @@ function summarize(requested, transactions, totalElapsedMs) {
         }
     }
 
-    const count = transactions.length;
+    const attempted = transactions.length;
+    const completed = approved + declined;
 
     return {
         requested,
+        attempted,
+        completed,
         approved,
         declined,
         failed,
+        failure_reasons: failureReasons(transactions),
         total_sales: salesCents / 100,
-        average_ms: count ? roundMs(sumMs / count) : 0,
-        min_ms: count ? roundMs(minMs) : 0,
-        max_ms: count ? roundMs(maxMs) : 0,
+        average_ms: attempted ? roundMs(sumMs / attempted) : 0,
+        min_ms: attempted ? roundMs(minMs) : 0,
+        max_ms: attempted ? roundMs(maxMs) : 0,
         total_elapsed_ms: roundMs(totalElapsedMs)
+    };
+}
+
+function receiptActivityRow(row) {
+    return {
+        receipt_id: Number(row.receipt_id),
+        store_id: Number(row.store_id),
+        store_name: row.store_name == null ? null : String(row.store_name),
+        receipt_date: row.receipt_date == null ? null : String(row.receipt_date),
+        receipt_time: row.receipt_time == null ? null : String(row.receipt_time),
+        subtotal: roundMoney(row.subtotal),
+        tax_amount: roundMoney(row.tax_amount),
+        total_amount: roundMoney(row.total_amount),
+        payment_method: row.payment_method == null ? null : String(row.payment_method),
+        payment_status: row.payment_status == null ? null : String(row.payment_status)
     };
 }
 
@@ -546,6 +591,56 @@ async function loadCatalog() {
     };
 }
 
+router.get('/simulate/receipts', async (req, res) => {
+    const interval = RECEIPT_INTERVALS[req.query.interval];
+
+    if (!interval) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'interval must be one of 5min, 15min, 1hour, or 24hour'
+        });
+    }
+
+    try {
+        const result = await pool.query(`
+            SELECT
+                r.receipt_id,
+                r.store_id,
+                s.store_name,
+                to_char(r.receipt_date, 'YYYY-MM-DD') AS receipt_date,
+                to_char(r.receipt_time, 'HH24:MI:SS') AS receipt_time,
+                r.subtotal,
+                r.tax_amount,
+                r.total_amount,
+                p.payment_method,
+                p.payment_status
+            FROM supermarkets.receipt r
+            JOIN supermarkets.store s ON s.store_id = r.store_id
+            LEFT JOIN supermarkets.payment p ON p.receipt_id = r.receipt_id
+            WHERE (r.receipt_date + r.receipt_time) >= LOCALTIMESTAMP - $1::interval
+            ORDER BY r.receipt_date DESC, r.receipt_time DESC, r.receipt_id DESC
+            LIMIT $2
+        `, [interval.sql, RECENT_RECEIPT_LIMIT + 1]);
+
+        const truncated = result.rows.length > RECENT_RECEIPT_LIMIT;
+        res.json({
+            interval: req.query.interval,
+            label: interval.label,
+            truncated,
+            rows: result.rows.slice(0, RECENT_RECEIPT_LIMIT).map(receiptActivityRow)
+        });
+    } catch (error) {
+        console.error('Recent receipts error:', error.message);
+        const missing = /does not exist/i.test(error.message);
+        res.status(500).json({
+            status: 'error',
+            message: missing
+                ? 'Recent receipts failed: the receipt tables are missing. Run Simulation to create them, then try again.'
+                : 'Unable to load recent receipts.'
+        });
+    }
+});
+
 router.post('/simulate', async (req, res) => {
     const parsed = parseSimulationRequest(req.body);
 
@@ -553,6 +648,16 @@ router.post('/simulate', async (req, res) => {
         return res.status(400).json({
             status: 'error',
             message: parsed.error
+        });
+    }
+
+    try {
+        await ensureSimulationDatabase();
+    } catch (error) {
+        console.error('Simulation initialization error:', error.message);
+        return res.status(500).json({
+            status: 'error',
+            message: error.message || 'Simulation did not start: database setup failed.'
         });
     }
 
@@ -599,3 +704,4 @@ router.post('/simulate', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.summarize = summarize;

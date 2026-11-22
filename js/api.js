@@ -779,8 +779,12 @@ const API = (function () {
       lines.push(`-- ${line}`);
     });
     lines.push('-- The endpoint does not return the SQL it executed.');
-    lines.push('-- It loads stocked products and bank accounts, then runs each');
-    lines.push('-- checkout through the existing checkout service.');
+    lines.push('-- It first runs sql/schema.sql and sql/seed.sql in one transaction.');
+    lines.push('-- CREATE TABLE IF NOT EXISTS and ON CONFLICT DO NOTHING add only');
+    lines.push('-- missing tables and reference rows. Receipts, inventory quantities,');
+    lines.push('-- and bank balances are left unchanged.');
+    lines.push('-- Checkouts start only after that transaction commits.');
+    lines.push('-- Each checkout goes through the existing checkout service.');
     return lines.join('\n');
   }
 
@@ -799,6 +803,30 @@ const API = (function () {
     };
   }
 
+  function deriveFailureReasons(transactions) {
+    const counts = new Map();
+    transactions.forEach((tx) => {
+      if (tx.status !== 'failed') return;
+      const message = tx.message || 'Checkout failed';
+      counts.set(message, (counts.get(message) || 0) + 1);
+    });
+    return Array.from(counts, ([message, count]) => ({ message, count }))
+      .sort((a, b) => b.count - a.count || a.message.localeCompare(b.message));
+  }
+
+  function normalizeFailureReasons(value) {
+    if (!Array.isArray(value)) return null;
+    const reasons = [];
+    value.forEach((row) => {
+      if (!row || typeof row !== 'object') return;
+      const message = row.message == null ? '' : String(row.message);
+      const count = Number(row.count);
+      if (!message || !Number.isInteger(count) || count < 1) return;
+      reasons.push({ message, count });
+    });
+    return reasons;
+  }
+
   function simulationResult(body, sql, ms) {
     const summary = body && body.summary;
     const transactions = body && body.transactions;
@@ -807,6 +835,8 @@ const API = (function () {
     }
     const normalized = {
       requested: optionalNumber(summary.requested),
+      attempted: optionalNumber(summary.attempted),
+      completed: optionalNumber(summary.completed),
       approved: optionalNumber(summary.approved),
       declined: optionalNumber(summary.declined),
       failed: optionalNumber(summary.failed),
@@ -819,11 +849,14 @@ const API = (function () {
     if (Object.keys(normalized).some((key) => normalized[key] == null)) {
       throw fail('Simulation returned an unexpected summary.', sql, ms);
     }
+    const mapped = transactions
+      .filter((row) => row && typeof row === 'object')
+      .map(simulationTransaction);
+    normalized.failure_reasons = normalizeFailureReasons(summary.failure_reasons)
+      || deriveFailureReasons(mapped);
     return {
       summary: normalized,
-      transactions: transactions
-        .filter((row) => row && typeof row === 'object')
-        .map(simulationTransaction)
+      transactions: mapped
     };
   }
 
@@ -856,8 +889,69 @@ const API = (function () {
     return { data: simulationResult(body, sql, ms), sql, ms };
   }
 
-  async function getRecentActivity() {
-    pending('Activity by time window is not available yet. Nothing was queried.');
+  const RECEIPT_INTERVALS = {
+    '5min': '5 minutes',
+    '15min': '15 minutes',
+    '1hour': '1 hour',
+    '24hour': '24 hours'
+  };
+
+  function recentReceipt(row) {
+    const source = row && typeof row === 'object' ? row : {};
+    return {
+      receipt_id: optionalNumber(source.receipt_id),
+      store_id: optionalNumber(source.store_id),
+      store_name: source.store_name == null ? null : String(source.store_name),
+      receipt_date: source.receipt_date == null ? null : String(source.receipt_date),
+      receipt_time: source.receipt_time == null ? null : String(source.receipt_time),
+      subtotal: optionalNumber(source.subtotal),
+      tax_amount: optionalNumber(source.tax_amount),
+      total_amount: optionalNumber(source.total_amount),
+      payment_method: source.payment_method == null ? null : String(source.payment_method),
+      payment_status: source.payment_status == null ? null : String(source.payment_status)
+    };
+  }
+
+  function recentReceiptsResult(body, sql, ms) {
+    if (!body || typeof body !== 'object' || !Array.isArray(body.rows) || typeof body.label !== 'string') {
+      throw fail('Recent receipts returned an unexpected response.', sql, ms);
+    }
+    return {
+      interval: body.interval == null ? '' : String(body.interval),
+      label: body.label,
+      truncated: Boolean(body.truncated),
+      rows: body.rows
+        .filter((row) => row && typeof row === 'object')
+        .map(recentReceipt)
+    };
+  }
+
+  async function getRecentReceipts(interval) {
+    const label = RECEIPT_INTERVALS[interval];
+    const sql = [
+      `GET /api/simulate/receipts?interval=${interval || ''}`,
+      'SELECT r.receipt_id, r.store_id, s.store_name,',
+      "       to_char(r.receipt_date, 'YYYY-MM-DD') AS receipt_date,",
+      "       to_char(r.receipt_time, 'HH24:MI:SS') AS receipt_time,",
+      '       r.subtotal, r.tax_amount, r.total_amount,',
+      '       p.payment_method, p.payment_status',
+      'FROM supermarkets.receipt r',
+      'JOIN supermarkets.store s ON s.store_id = r.store_id',
+      'LEFT JOIN supermarkets.payment p ON p.receipt_id = r.receipt_id',
+      'WHERE (r.receipt_date + r.receipt_time) >= LOCALTIMESTAMP - $1::interval',
+      'ORDER BY r.receipt_date DESC, r.receipt_time DESC, r.receipt_id DESC',
+      'LIMIT $2;',
+      label ? `-- $1 = '${label}'` : '-- interval was not one of the four presets'
+    ].join('\n');
+    if (!label) {
+      throw fail('Recent receipts failed before the server call: choose the last 5 minutes, 15 minutes, 1 hour, or 24 hours.', sql, 0);
+    }
+    const { body, ms } = await request(
+      'GET',
+      `/api/simulate/receipts?interval=${encodeURIComponent(interval)}`,
+      sql
+    );
+    return { data: recentReceiptsResult(body, sql, ms), sql, ms };
   }
 
   return {
@@ -875,7 +969,7 @@ const API = (function () {
     resetTransactionTables,
     deleteAllRows,
     runSimulation,
-    getRecentActivity
+    getRecentReceipts
   };
 })();
 
