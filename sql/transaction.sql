@@ -4,10 +4,15 @@
 -- Source: server/services/checkoutService.js, processCheckout()
 --
 -- This file records the SQL that processCheckout() sends to PostgreSQL, in
--- the order the approved-sale path runs. It is not a standalone script
--- Placeholders ($1, $2, ...) are bound by the application. Loops, money
--- math, validation, and the cash/card branch are application logic; they
--- are described in comments and are not SQL.
+-- the order the approved-sale path runs. It is not a standalone script.
+-- Placeholders ($1, $2, ...) are bound by the application. Loops, validation,
+-- and the cash/card branch are application logic; they are described in
+-- comments and are not SQL.
+--
+-- Line totals, the taxable subtotal, tax, and the grand total are SQL.
+-- Each line is rounded with ROUND before SUM. Tax is ROUND of the taxable
+-- subtotal times the state tax rate, once. The receipt, receipt lines,
+-- payment, and card debit all use those results.
 --
 -- Do not execute this file!!!!!
 -- =============================================================================
@@ -36,19 +41,16 @@ BEGIN;
 -- -----------------------------------------------------------------------------
 SELECT s.store_id, t.tax_rate
 FROM supermarkets.store s
-JOIN supermarkets.statetax t ON s.state = t.state
+INNER JOIN supermarkets.statetax t ON s.state = t.state
 WHERE s.store_id = $1;
 
 -- Application: zero rows throws Error('Store not found'). The catch block
 -- then issues ROLLBACK (see "Error exit" below) and rethrows.
 --
--- Otherwise:
---   taxRate = Number(tax_rate)
---   subtotalCents = 0
---   taxableCents = 0
--- Items are copied and sorted by SKU (localeCompare) before the inventory
--- loop so concurrent checkouts lock inventory rows in the same order.
--- A Set records SKUs already seen in this request.
+-- Otherwise the items are copied and sorted by SKU (localeCompare) before
+-- the inventory loop so concurrent checkouts lock inventory rows in the
+-- same order. A Set records SKUs already seen in this request.
+-- JavaScript does not multiply prices or tax rates.
 
 
 -- -----------------------------------------------------------------------------
@@ -62,7 +64,7 @@ WHERE s.store_id = $1;
 SELECT p.sku, p.unit_price, p.tax_treatment,
        p.sold_by_weight, i.available_quantity
 FROM supermarkets.product p
-JOIN supermarkets.inventory i ON i.sku = p.sku
+INNER JOIN supermarkets.inventory i ON i.sku = p.sku
 WHERE p.sku = $1 AND i.store_id = $2
 FOR UPDATE OF i;
 
@@ -83,31 +85,100 @@ FOR UPDATE OF i;
 --   available_quantity < amount throws Error('Insufficient stock for <sku>').
 --   Each of those throws reaches the catch block, which issues ROLLBACK.
 --
---   Line amount in cents:
---     lineCents = round(Number(unit_price) * amount * 100)
---     subtotalCents += lineCents
---     if tax_treatment = 'taxable' then taxableCents += lineCents
---   The line kept for later inserts:
---     quantity = amount for counted items, null for weighed items
---     weight   = amount for weighed items, null for counted items
---     unit_price from the product row
---     line_total = (lineCents / 100) fixed to two decimals
---     amount as above (used only for the inventory update)
+-- The amount sent to the next statement is that quantity or weight written
+-- with two decimal places.
+
+
+-- -----------------------------------------------------------------------------
+-- Line total
+-- Repeated once per item that passed the checks above, while the inventory
+-- lock from the previous statement is still held.
+-- $1 = item.sku
+-- $2 = store_id
+-- $3 = amount with two decimal places
+-- unit_price is numeric. ROUND(..., 2) is half away from zero.
+-- Zero rows throws Error('Product <sku> is not stocked here').
+-- -----------------------------------------------------------------------------
+SELECT p.unit_price,
+       p.tax_treatment,
+       ROUND(p.unit_price * $3::numeric, 2) AS line_total
+FROM supermarkets.product p
+INNER JOIN supermarkets.inventory i ON i.sku = p.sku
+WHERE p.sku = $1 AND i.store_id = $2;
+
+-- Application keeps, for each line, in sorted-SKU order:
+--   quantity = amount for counted items, null for weighed items
+--   weight   = amount for weighed items, null for counted items
+--   unit_price and line_total from this SELECT
+--   tax_treatment from this SELECT ('taxable' is taxed; every other value,
+--   including 'exempt' and null, is not)
+--   amount as above (used only for the later inventory update)
+
+
+-- -----------------------------------------------------------------------------
+-- Subtotal, taxable subtotal, tax, and grand total
+-- Issued once, after every line total above.
+-- The FROM list contains one SELECT per purchased line. A one-line checkout
+-- has no UNION ALL. Each added line appends:
+--   UNION ALL
+--   SELECT $n::numeric(10,2) AS line_total, $n+1::text AS tax_treatment
+-- The last placeholder is the store id. The two-line form below is the
+-- shape for two lines; $5 is the store id only in that form.
 --
--- After every item:
---   taxCents   = round(taxableCents * taxRate)
---   totalCents = subtotalCents + taxCents
---   total      = (totalCents / 100) fixed to two decimals
--- Cash does not touch banking.bankaccount. Card continues below.
+-- $1 = line 1 line_total from the line-total SELECT
+-- $2 = line 1 tax_treatment
+-- $3 = line 2 line_total
+-- $4 = line 2 tax_treatment
+-- $5 = store_id
+--
+-- SUM adds the already rounded line totals. The CASE keeps a second sum of
+-- only the taxable lines. ROUND applies the state tax rate once. The grand
+-- total is that subtotal plus that tax. Zero rows throws
+-- Error('Store not found') and the catch block issues ROLLBACK.
+-- -----------------------------------------------------------------------------
+SELECT
+    SUM(src.line_total)::numeric(10,2) AS subtotal,
+    SUM(CASE
+        WHEN src.tax_treatment = 'taxable' THEN src.line_total
+        ELSE 0
+    END)::numeric(10,2) AS taxable_subtotal,
+    ROUND(
+        SUM(CASE
+            WHEN src.tax_treatment = 'taxable' THEN src.line_total
+            ELSE 0
+        END) * t.tax_rate,
+        2
+    ) AS tax_amount,
+    (
+        SUM(src.line_total) + ROUND(
+            SUM(CASE
+                WHEN src.tax_treatment = 'taxable' THEN src.line_total
+                ELSE 0
+            END) * t.tax_rate,
+            2
+        )
+    )::numeric(10,2) AS total_amount
+FROM (
+    SELECT $1::numeric(10,2) AS line_total, $2::text AS tax_treatment
+    UNION ALL
+    SELECT $3::numeric(10,2) AS line_total, $4::text AS tax_treatment
+) AS src
+INNER JOIN supermarkets.store s ON s.store_id = $5
+INNER JOIN supermarkets.statetax t ON s.state = t.state
+GROUP BY t.tax_rate;
+
+-- Application: subtotal, tax_amount, and total_amount from this one row are
+-- the values used for the card debit, the receipt, the payment, and the
+-- response. Cash does not touch banking.bankaccount. Card continues below.
 
 
 -- -----------------------------------------------------------------------------
 -- Card balance deduction
 -- Issued only when payment_method = 'cash' is false (payment_method = 'card').
--- $1 = total (two-decimal text)
+-- $1 = total_amount from the totals SELECT
 -- $2 = account_id
 -- The balance predicate makes the debit conditional: a row is returned only
--- when the account exists and account_balance >= total.
+-- when the account exists and account_balance >= total_amount.
 -- -----------------------------------------------------------------------------
 UPDATE banking.bankaccount
 SET account_balance = account_balance - $1
@@ -130,11 +201,11 @@ RETURNING account_id;
 -- pg_advisory_xact_lock(3380, 1) is the existing transaction-scoped lock
 -- held for receipt_id generation. It releases on COMMIT or ROLLBACK.
 --
--- Receipt parameters:
+-- Receipt parameters, taken from the totals SELECT:
 --   $1 = store_id
---   $2 = (subtotalCents / 100) fixed to two decimals
---   $3 = (taxCents / 100) fixed to two decimals
---   $4 = total
+--   $2 = subtotal
+--   $3 = tax_amount
+--   $4 = total_amount
 -- receipt_id is COALESCE(MAX(receipt_id), 0) + 1 inside this transaction.
 -- -----------------------------------------------------------------------------
 SELECT pg_advisory_xact_lock(3380, 1);
@@ -166,8 +237,8 @@ RETURNING receipt_id;
 --   $3 = sku
 --   $4 = quantity (null when sold by weight)
 --   $5 = weight (null when sold by count)
---   $6 = unit_price from the locked product row
---   $7 = line_total (two-decimal text)
+--   $6 = unit_price from the line-total SELECT
+--   $7 = line_total from the line-total SELECT
 --
 -- Inventory:
 --   $1 = amount (quantity or weight)
@@ -193,7 +264,7 @@ WHERE store_id = $2 AND sku = $3;
 -- $1 = receiptId
 -- $2 = account_id when payment_method = 'card', otherwise null
 -- $3 = payment_method ('cash' or 'card')
--- $4 = total
+-- $4 = total_amount from the totals SELECT
 -- payment_status is the literal 'approved'.
 -- payment_id is COALESCE(MAX(payment_id), 0) + 1 inside this transaction.
 -- -----------------------------------------------------------------------------
@@ -210,7 +281,7 @@ VALUES (
 
 -- Application then commits and returns
 -- { saved: true, receipt_id, subtotal, tax, total, payment_status: 'approved' }
--- with subtotal, tax, and total as cent totals divided by 100.
+-- with subtotal, tax, and total taken from the totals SELECT.
 
 COMMIT;
 
@@ -219,7 +290,7 @@ COMMIT;
 -- Card decline exit
 -- Not part of the approved path above. processCheckout() issues these two
 -- statements only when the bankaccount UPDATE returns no row. ROLLBACK ends
--- the transaction here.
+-- the transaction here. Inventory locks are released and no receipt remains.
 -- $1 = account_id
 -- =============================================================================
 SELECT account_id

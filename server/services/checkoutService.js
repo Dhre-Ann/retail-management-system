@@ -11,6 +11,59 @@ const pool = require('../db/pool');
 // An unknown bank account throws Error('Bank account not found') with statusCode 400.
 // Store, stock, product, and SQL failures throw Error with the same message as before.
 // The route turns thrown errors into the HTTP response.
+
+// The hundredths already accepted by the weight and quantity checks.
+function amountParam(amount) {
+    return (Math.round(amount * 100) / 100).toFixed(2);
+}
+
+// One SELECT branch per line. PostgreSQL sums the rounded line totals,
+// keeps a taxable subtotal, and rounds tax once.
+function pricingTotalsSql(lineCount) {
+    const parts = [];
+
+    for (let i = 0; i < lineCount; i += 1) {
+        const lineParam = i * 2 + 1;
+        const treatmentParam = lineParam + 1;
+        parts.push(
+            `SELECT $${lineParam}::numeric(10,2) AS line_total, $${treatmentParam}::text AS tax_treatment`
+        );
+    }
+
+    const storeParam = lineCount * 2 + 1;
+
+    return `
+        SELECT
+            SUM(src.line_total)::numeric(10,2) AS subtotal,
+            SUM(CASE
+                WHEN src.tax_treatment = 'taxable' THEN src.line_total
+                ELSE 0
+            END)::numeric(10,2) AS taxable_subtotal,
+            ROUND(
+                SUM(CASE
+                    WHEN src.tax_treatment = 'taxable' THEN src.line_total
+                    ELSE 0
+                END) * t.tax_rate,
+                2
+            ) AS tax_amount,
+            (
+                SUM(src.line_total) + ROUND(
+                    SUM(CASE
+                        WHEN src.tax_treatment = 'taxable' THEN src.line_total
+                        ELSE 0
+                    END) * t.tax_rate,
+                    2
+                )
+            )::numeric(10,2) AS total_amount
+        FROM (
+            ${parts.join('\n            UNION ALL\n            ')}
+        ) AS src
+        INNER JOIN supermarkets.store s ON s.store_id = $${storeParam}
+        INNER JOIN supermarkets.statetax t ON s.state = t.state
+        GROUP BY t.tax_rate
+    `;
+}
+
 async function processCheckout(payload) {
     const { store_id, payment_method, account_id, items } = payload;
 
@@ -42,7 +95,7 @@ async function processCheckout(payload) {
         const storeResult = await client.query(`
             SELECT s.store_id, t.tax_rate
             FROM supermarkets.store s
-            JOIN supermarkets.statetax t ON s.state = t.state
+            INNER JOIN supermarkets.statetax t ON s.state = t.state
             WHERE s.store_id = $1
         `, [store_id]);
 
@@ -51,9 +104,6 @@ async function processCheckout(payload) {
             throw new Error('Store not found');
         }
 
-        const taxRate = Number(storeResult.rows[0].tax_rate);
-        let subtotalCents = 0;
-        let taxableCents = 0;
         const purchasedItems = [];
         const seen = new Set();
 
@@ -75,7 +125,7 @@ async function processCheckout(payload) {
                 SELECT p.sku, p.unit_price, p.tax_treatment,
                        p.sold_by_weight, i.available_quantity
                 FROM supermarkets.product p
-                JOIN supermarkets.inventory i ON i.sku = p.sku
+                INNER JOIN supermarkets.inventory i ON i.sku = p.sku
                 WHERE p.sku = $1 AND i.store_id = $2
                 FOR UPDATE OF i
             `, [item.sku, store_id]);
@@ -103,30 +153,52 @@ async function processCheckout(payload) {
                 throw new Error(`Insufficient stock for ${item.sku}`);
             }
 
-            // rounding each line to cents
-            const lineCents = Math.round(
-                Number(product.unit_price) * amount * 100
-            );
+            // price and line total come from PostgreSQL while the inventory lock is held
+            const priced = await client.query(`
+                SELECT p.unit_price,
+                       p.tax_treatment,
+                       ROUND(p.unit_price * $3::numeric, 2) AS line_total
+                FROM supermarkets.product p
+                INNER JOIN supermarkets.inventory i ON i.sku = p.sku
+                WHERE p.sku = $1 AND i.store_id = $2
+            `, [item.sku, store_id, amountParam(amount)]);
 
-            subtotalCents += lineCents;
-
-            if (product.tax_treatment === 'taxable') {
-                taxableCents += lineCents;
+            if (!priced.rows.length) {
+                throw new Error(`Product ${item.sku} is not stocked here`);
             }
+
+            const line = priced.rows[0];
 
             purchasedItems.push({
                 sku: item.sku,
                 quantity: weighed ? null : amount,
                 weight: weighed ? amount : null,
-                unit_price: product.unit_price,
-                line_total: (lineCents / 100).toFixed(2),
+                unit_price: line.unit_price,
+                line_total: line.line_total,
+                tax_treatment: line.tax_treatment,
                 amount
             });
         }
 
-        const taxCents = Math.round(taxableCents * taxRate);
-        const totalCents = subtotalCents + taxCents;
-        const total = (totalCents / 100).toFixed(2);
+        const totalParams = [];
+        for (const line of purchasedItems) {
+            totalParams.push(line.line_total, line.tax_treatment);
+        }
+        totalParams.push(store_id);
+
+        const totalsResult = await client.query(
+            pricingTotalsSql(purchasedItems.length),
+            totalParams
+        );
+
+        if (!totalsResult.rows.length) {
+            throw new Error('Store not found');
+        }
+
+        const totals = totalsResult.rows[0];
+        const subtotal = totals.subtotal;
+        const taxAmount = totals.tax_amount;
+        const totalAmount = totals.total_amount;
 
         // check and debit bank account for card payments
         if (payment_method === 'card') {
@@ -136,7 +208,7 @@ async function processCheckout(payload) {
                 WHERE account_id = $2
                   AND account_balance >= $1
                 RETURNING account_id
-            `, [total, account_id]);
+            `, [totalAmount, account_id]);
 
             if (!debit.rows.length) {
                 const account = await client.query(`
@@ -178,9 +250,9 @@ async function processCheckout(payload) {
             RETURNING receipt_id
         `, [
             store_id,
-            (subtotalCents / 100).toFixed(2),
-            (taxCents / 100).toFixed(2),
-            total
+            subtotal,
+            taxAmount,
+            totalAmount
         ]);
 
         const receiptId = receiptResult.rows[0].receipt_id;
@@ -223,7 +295,7 @@ async function processCheckout(payload) {
             receiptId,
             payment_method === 'card' ? account_id : null,
             payment_method,
-            total
+            totalAmount
         ]);
 
         // committing the transaction
@@ -232,9 +304,9 @@ async function processCheckout(payload) {
         return {
             saved: true,
             receipt_id: receiptId,
-            subtotal: subtotalCents / 100,
-            tax: taxCents / 100,
-            total: totalCents / 100,
+            subtotal: Number(subtotal),
+            tax: Number(taxAmount),
+            total: Number(totalAmount),
             payment_status: 'approved'
         };
 
