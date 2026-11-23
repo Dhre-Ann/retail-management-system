@@ -634,9 +634,9 @@ const API = (function () {
       PAYMENTS_BY_METHOD_SQL
     ].join('\n');
     const { body, ms } = await request('GET', '/api/reports/payments-by-method', sql);
-    const rows = expectArray(body, 'Payments by method', sql, ms);
+    const rows = expectArray(body, 'Recorded payments by method', sql, ms);
     return reportTable(
-      'Payments by method',
+      'Recorded payments by method',
       [
         { key: 'payment_method', label: 'payment_method' },
         { key: 'payment_status', label: 'payment_status' },
