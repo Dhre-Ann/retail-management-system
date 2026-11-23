@@ -73,15 +73,17 @@ JOIN supermarkets.product p
 WHERE i.available_quantity < 10
 ORDER BY s.state, i.available_quantity ASC;
 
--- Q6. Payments by Method
+-- Q6. Payments by Method (Payment JOIN Receipt)
 SELECT
-    payment_method,
-    payment_status,
+    p.payment_method,
+    p.payment_status,
     COUNT(*) AS num_payments,
-    COALESCE(SUM(amount), 0) AS total_amount
-FROM supermarkets.payment
-GROUP BY payment_method, payment_status
-ORDER BY payment_method, payment_status;
+    COALESCE(SUM(p.amount), 0) AS total_amount
+FROM supermarkets.payment p
+JOIN supermarkets.receipt r
+    ON r.receipt_id = p.receipt_id
+GROUP BY p.payment_method, p.payment_status
+ORDER BY p.payment_method, p.payment_status;
 
 
 

@@ -466,13 +466,15 @@ const API = (function () {
 
   const PAYMENTS_BY_METHOD_SQL = [
     'SELECT',
-    '    payment_method,',
-    '    payment_status,',
+    '    p.payment_method,',
+    '    p.payment_status,',
     '    COUNT(*) AS num_payments,',
-    '    COALESCE(SUM(amount), 0) AS total_amount',
-    'FROM supermarkets.payment',
-    'GROUP BY payment_method, payment_status',
-    'ORDER BY payment_method, payment_status;'
+    '    COALESCE(SUM(p.amount), 0) AS total_amount',
+    'FROM supermarkets.payment p',
+    'JOIN supermarkets.receipt r',
+    '    ON r.receipt_id = p.receipt_id',
+    'GROUP BY p.payment_method, p.payment_status',
+    'ORDER BY p.payment_method, p.payment_status;'
   ].join('\n');
 
   function isoDate(value) {
