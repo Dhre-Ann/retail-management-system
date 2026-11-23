@@ -385,6 +385,31 @@ require.cache[poolPath] = {
 };
 delete require.cache[checkoutPath];
 const { processCheckout } = require(checkoutPath);
+const checkoutRoutePath = require.resolve(path.join(root, 'server', 'routes', 'checkout.js'));
+delete require.cache[checkoutRoutePath];
+const checkoutRouter = require(checkoutRoutePath);
+
+function postCheckout(body) {
+    const layer = checkoutRouter.stack.find((entry) => (
+        entry.route
+        && entry.route.path === '/checkout'
+        && entry.route.methods.post
+    ));
+    assert.ok(layer, 'missing POST /checkout');
+    const res = {
+        statusCode: 200,
+        body: null,
+        status(code) {
+            this.statusCode = code;
+            return this;
+        },
+        json(payload) {
+            this.body = payload;
+            return this;
+        }
+    };
+    return layer.route.stack[layer.route.stack.length - 1].handle({ body }, res).then(() => res);
+}
 
 function addTax(state, rate) {
     db.taxes.set(state, rate);
@@ -636,7 +661,8 @@ describe('bank funds and rollback', () => {
             items: [{ sku: 'COL-401', quantity: 1 }]
         });
 
-        assert.deepEqual(result, { saved: false, message: 'Insufficient funds' });
+        assert.equal(result.saved, false);
+        assert.equal(result.message, 'Insufficient funds');
         assert.equal(db.accounts.get(4).balance, '1.00');
         assert.equal(db.accounts.get(7).balance, '100.00');
         assert.equal(db.inventory.get(stockKey(1, 'COL-401')).available, '20.00');
@@ -811,5 +837,153 @@ describe('concurrent checkouts', () => {
         assert.equal(db.payments[0].amount, '10.00');
         assert.equal(db.receipts[0].total_amount, '10.00');
         assert.equal(db.receipts[0].tax_amount, '0.00');
+    });
+});
+
+describe('checkout SQL visibility', () => {
+    function traceText(statements) {
+        return statements.map(compact);
+    }
+
+    test('a successful card checkout returns the statements that ran, in order, with placeholders', async () => {
+        addProduct('MLK-101', '3.49', 'exempt', false);
+        addProduct('COL-401', '7.49', 'taxable', false);
+        addInventory(1, 'MLK-101', '20.00');
+        addInventory(1, 'COL-401', '20.00');
+
+        const payload = {
+            store_id: 1,
+            payment_method: 'card',
+            account_id: 7,
+            items: [
+                { sku: 'MLK-101', quantity: 3 },
+                { sku: 'COL-401', quantity: 2 }
+            ]
+        };
+        const result = await processCheckout(payload);
+        const res = await postCheckout(payload);
+
+        assert.equal(result.saved, true);
+        assert.equal(result.total, 26.69);
+        assert.deepEqual(traceText(result.sql_statements), db.log.slice(0, result.sql_statements.length));
+        assert.deepEqual(res.body.sql_statements, result.sql_statements);
+        assert.equal(compact(result.sql_statements[0]), 'BEGIN');
+        assert.equal(compact(result.sql_statements.at(-1)), 'COMMIT');
+
+        const joined = result.sql_statements.join('\n');
+        assert.match(joined, /FOR UPDATE OF i/);
+        assert.match(joined, /ROUND\(p\.unit_price \* \$3::numeric, 2\) AS line_total/);
+        assert.match(joined, /UNION ALL/);
+        assert.match(joined, /\$5/);
+        assert.match(joined, /UPDATE banking\.bankaccount/);
+        assert.match(joined, /INSERT INTO supermarkets\.receipt\b/);
+        assert.match(joined, /INSERT INTO supermarkets\.receiptitem/);
+        assert.match(joined, /UPDATE supermarkets\.inventory/);
+        assert.match(joined, /INSERT INTO supermarkets\.payment/);
+        assert.match(joined, /\$1/);
+        assert.doesNotMatch(joined, /26\.69|25\.45|14\.98|10\.47|73\.31/);
+        assert.doesNotMatch(joined, /MLK-101|COL-401/);
+        assert.doesNotMatch(joined, /password|postgres:\/\//i);
+        assert.equal(result.payment_status, 'approved');
+        assert.equal(res.statusCode, 200);
+        assert.equal(res.body.saved, true);
+        assert.equal(res.body.total, 26.69);
+        assert.equal(res.body.payment_status, 'approved');
+    });
+
+    test('a cash checkout trace omits the bank update and still records inventory and receipt SQL', async () => {
+        addProduct('BAN-001', '0.69', 'exempt', true);
+        addInventory(1, 'BAN-001', '10.00');
+
+        const result = await processCheckout({
+            store_id: 1,
+            payment_method: 'cash',
+            account_id: null,
+            items: [{ sku: 'BAN-001', weight: 1.5 }]
+        });
+
+        const joined = result.sql_statements.join('\n');
+        assert.deepEqual(traceText(result.sql_statements), db.log);
+        assert.match(joined, /AS taxable_subtotal/);
+        assert.doesNotMatch(joined, /UNION ALL/);
+        assert.match(joined, /\$3/);
+        assert.match(joined, /INSERT INTO supermarkets\.receiptitem/);
+        assert.match(joined, /UPDATE supermarkets\.inventory/);
+        assert.doesNotMatch(joined, /UPDATE banking\.bankaccount/);
+        assert.doesNotMatch(joined, /1\.04|1\.13|BAN-001/);
+        assert.equal(compact(result.sql_statements.at(-1)), 'COMMIT');
+    });
+
+    test('insufficient funds returns the statements sent before ROLLBACK and no receipt SQL', async () => {
+        addProduct('COL-401', '7.49', 'taxable', false);
+        addInventory(1, 'COL-401', '20.00');
+        addAccount(4, '1.00');
+
+        const payload = {
+            store_id: 1,
+            payment_method: 'card',
+            account_id: 4,
+            items: [{ sku: 'COL-401', quantity: 1 }]
+        };
+        const result = await processCheckout(payload);
+        const res = await postCheckout(payload);
+
+        assert.equal(result.saved, false);
+        assert.equal(result.message, 'Insufficient funds');
+        assert.deepEqual(traceText(result.sql_statements), db.log.slice(0, result.sql_statements.length));
+        assert.deepEqual(res.body.sql_statements, result.sql_statements);
+        assert.equal(res.statusCode, 200);
+
+        const texts = traceText(result.sql_statements);
+        assert.equal(texts[0], 'BEGIN');
+        assert.equal(texts.at(-1), 'ROLLBACK');
+        assert.equal(texts.includes('COMMIT'), false);
+        assert.ok(texts.some((text) => text.startsWith('UPDATE banking.bankaccount')));
+        assert.ok(texts.some((text) => text.includes('FROM banking.bankaccount')));
+        assert.equal(texts.some((text) => text.includes('INSERT INTO supermarkets.receipt')), false);
+        assert.equal(texts.some((text) => text.includes('UPDATE supermarkets.inventory')), false);
+        assert.doesNotMatch(result.sql_statements.join('\n'), /COL-401|account_number|password/i);
+    });
+
+    test('a stock failure keeps the statements executed before ROLLBACK on the error and the HTTP response', async () => {
+        addProduct('COL-401', '7.49', 'taxable', false);
+        addInventory(1, 'COL-401', '0.00');
+        const payload = {
+            store_id: 1,
+            payment_method: 'cash',
+            account_id: null,
+            items: [{ sku: 'COL-401', quantity: 1 }]
+        };
+
+        await assert.rejects(
+            () => processCheckout(payload),
+            (error) => {
+                assert.match(error.message, /Insufficient stock for COL-401/);
+                const texts = traceText(error.sql_statements);
+                assert.deepEqual(texts, db.log);
+                assert.equal(texts[0], 'BEGIN');
+                assert.equal(texts.at(-1), 'ROLLBACK');
+                assert.ok(texts.some((text) => text.includes('FOR UPDATE OF i')));
+                assert.equal(texts.some((text) => text.includes('INSERT INTO')), false);
+                assert.equal(texts.includes('COMMIT'), false);
+                assert.doesNotMatch(error.sql_statements.join('\n'), /COL-401/);
+                return true;
+            }
+        );
+
+        const res = await postCheckout(payload);
+        assert.equal(res.statusCode, 400);
+        assert.match(res.body.message, /Insufficient stock for COL-401/);
+        assert.equal(compact(res.body.sql_statements.at(-1)), 'ROLLBACK');
+        assert.ok(res.body.sql_statements.some((statement) => statement.includes('FOR UPDATE OF i')));
+        assert.equal(res.body.sql_statements.some((statement) => statement.includes('COMMIT')), false);
+    });
+
+    test('an invalid checkout records that no SQL was sent', async () => {
+        const res = await postCheckout({ store_id: 1 });
+        assert.equal(res.statusCode, 400);
+        assert.equal(res.body.message, 'Invalid checkout request');
+        assert.deepEqual(res.body.sql_statements, []);
+        assert.equal(db.log.length, 0);
     });
 });

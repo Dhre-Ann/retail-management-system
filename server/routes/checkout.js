@@ -33,10 +33,14 @@ router.post('/checkout', async (req, res) => {
         const result = await processCheckout(req.body);
         res.json(result);
     } catch (error) {
-        res.status(error.statusCode || 400).json({
+        const body = {
             status: 'error',
             message: error.message
-        });
+        };
+        if (Array.isArray(error.sql_statements)) {
+            body.sql_statements = error.sql_statements;
+        }
+        res.status(error.statusCode || 400).json(body);
     }
 });
 

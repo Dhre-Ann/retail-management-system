@@ -5,9 +5,9 @@
  * { data, sql, ms } or throws an Error with .sql and .ms. The sql string is
  * the HTTP request plus the statement the Express route runs, when that
  * statement is the same on every call. It is recorded in the "SQL Sent to
- * Server" panel. Checkout records the request only: the route's statements
- * depend on the payment method and the result, so listing them would claim
- * work that may not have run.
+ * Server" panel. Checkout and simulation display the statement text the
+ * server captured while the transaction ran. Placeholders stay in the text.
+ * Bound values are not shown.
  *
  * Features that do not have a route yet throw instead of inventing rows.
  * Nothing in this file writes to the database except the functions that call
@@ -140,7 +140,14 @@ const API = (function () {
       const message = body && typeof body.message === 'string' && body.message
         ? body.message
         : `Request failed (${response.status}).`;
-      throw fail(message, sql, ms);
+      const error = fail(message, sql, ms);
+      if (body && Array.isArray(body.sql_statements)) {
+        error.sqlStatements = body.sql_statements;
+      }
+      if (body && body.representative_sql && typeof body.representative_sql === 'object') {
+        error.representativeSql = body.representative_sql;
+      }
+      throw error;
     }
     return { body, ms };
   }
@@ -316,28 +323,67 @@ const API = (function () {
     return { data, sql, ms };
   }
 
-  function checkoutSql(payload) {
-    const lines = ['POST /api/checkout'];
-    if (payload === undefined) {
-      lines.push('-- No request body was sent.');
-    } else {
-      lines.push('-- Request body:');
-      JSON.stringify(payload, null, 2).split('\n').forEach((line) => {
-        lines.push(`-- ${line}`);
+  function dedentSql(sql) {
+    const lines = String(sql).replace(/\r\n/g, '\n').trim().split('\n');
+    const indents = lines.slice(1)
+      .filter((line) => line.trim())
+      .map((line) => {
+        const match = line.match(/^[ ]*/);
+        return match ? match[0].length : 0;
       });
+    const margin = indents.length ? Math.min(...indents) : 0;
+    return lines.map((line, index) => (
+      index === 0 ? line.trimEnd() : line.slice(margin).trimEnd()
+    )).join('\n').trim();
+  }
+
+  function formatStatements(statements) {
+    if (!Array.isArray(statements)) return '';
+    return statements
+      .filter((statement) => typeof statement === 'string' && statement.trim())
+      .map((statement) => {
+        const text = dedentSql(statement);
+        return text.endsWith(';') ? text : `${text};`;
+      })
+      .join('\n\n');
+  }
+
+  function checkoutDisplay(statements) {
+    const lines = ['POST /api/checkout'];
+    if (Array.isArray(statements) && statements.length === 0) {
+      lines.push('-- No SQL was sent to PostgreSQL.');
+      return lines.join('\n');
     }
-    lines.push('-- The server runs checkout in one transaction. Which statements run');
-    lines.push('-- depends on the payment method and the result, so they are not listed here.');
+    const formatted = formatStatements(statements);
+    if (!formatted) {
+      lines.push('-- The server did not return checkout SQL for this request.');
+      return lines.join('\n');
+    }
+    lines.push('');
+    lines.push(formatted);
     return lines.join('\n');
   }
 
   async function checkout(payload) {
-    const sql = checkoutSql(payload);
-    const { body, ms } = await request('POST', '/api/checkout', sql, payload);
-    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.saved !== 'boolean') {
-      throw fail('Checkout returned an unexpected response.', sql, ms);
+    const pendingSql = checkoutDisplay(undefined);
+    try {
+      const { body, ms } = await request('POST', '/api/checkout', pendingSql, payload);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.saved !== 'boolean') {
+        const unexpected = fail(
+          'Checkout returned an unexpected response.',
+          checkoutDisplay(body && body.sql_statements),
+          ms
+        );
+        unexpected.sqlStatements = body && Array.isArray(body.sql_statements) ? body.sql_statements : undefined;
+        throw unexpected;
+      }
+      return { data: body, sql: checkoutDisplay(body.sql_statements), ms };
+    } catch (err) {
+      if (err && Array.isArray(err.sqlStatements)) {
+        err.sql = checkoutDisplay(err.sqlStatements);
+      }
+      throw err;
     }
-    return { data: body, sql, ms };
   }
 
   const SALES_BY_STORE_SQL = [
@@ -772,14 +818,40 @@ const API = (function () {
     return Number.isFinite(n) ? n : null;
   }
 
-  function simulationSql(payload) {
+  function appendRepresentativeTrace(lines, representative) {
+    const statements = representative && Array.isArray(representative.statements)
+      ? representative.statements
+      : null;
+    if (!statements) {
+      lines.push('-- No checkout transaction SQL was captured for this run.');
+      return;
+    }
+    const formatted = formatStatements(statements);
+    if (!formatted) {
+      lines.push('-- No checkout transaction SQL was captured for this run.');
+      return;
+    }
+    lines.push('-- Representative transaction trace.');
+    const number = Number(representative.transaction_number);
+    const outcome = typeof representative.outcome === 'string' && representative.outcome
+      ? representative.outcome
+      : '';
+    const where = Number.isInteger(number)
+      ? `transaction ${number}${outcome ? `, ${outcome}` : ''}`
+      : 'one checkout';
+    lines.push(`-- Statements below are from ${where}, in execution order.`);
+    lines.push('-- Other checkouts in this simulation are not listed.');
+    lines.push('');
+    lines.push(formatted);
+  }
+
+  function simulationSql(payload, representative) {
     const lines = ['POST /api/simulate'];
     lines.push('-- Request body:');
     JSON.stringify(payload, null, 2).split('\n').forEach((line) => {
       lines.push(`-- ${line}`);
     });
-    lines.push('-- The endpoint does not return the SQL it executed.');
-    lines.push('-- It first runs sql/schema.sql and sql/seed.sql in one transaction.');
+    lines.push('-- The server first runs sql/schema.sql and sql/seed.sql in one transaction.');
     lines.push('-- CREATE TABLE IF NOT EXISTS and ON CONFLICT DO NOTHING add only');
     lines.push('-- missing tables and reference rows. Receipts, inventory quantities,');
     lines.push('-- and bank balances are left unchanged.');
@@ -787,6 +859,8 @@ const API = (function () {
     lines.push('-- Each checkout goes through the existing checkout service.');
     lines.push('-- Stop sends POST /api/simulate/<run_id>/cancel. No new checkouts start');
     lines.push('-- after that; checkouts already in a transaction commit or roll back.');
+    lines.push('');
+    appendRepresentativeTrace(lines, representative);
     return lines.join('\n');
   }
 
@@ -877,7 +951,7 @@ const API = (function () {
       concurrency
     };
     if (options && options.run_id != null) payload.run_id = String(options.run_id);
-    const sql = simulationSql(payload);
+    const sql = simulationSql(payload, null);
     if (payload.run_id != null && !RUN_ID_PATTERN.test(payload.run_id)) {
       throw fail('Simulation did not start: run_id must be 8 to 64 letters, digits, hyphens, or underscores.', sql, 0);
     }
@@ -896,8 +970,16 @@ const API = (function () {
     if (concurrency > transactionCount) {
       throw fail('Simulation did not start: concurrency cannot be greater than transaction_count.', sql, 0);
     }
-    const { body, ms } = await request('POST', '/api/simulate', sql, payload, signal);
-    return { data: simulationResult(body, sql, ms), sql, ms };
+    try {
+      const { body, ms } = await request('POST', '/api/simulate', sql, payload, signal);
+      const display = simulationSql(payload, body && body.representative_sql);
+      return { data: simulationResult(body, display, ms), sql: display, ms };
+    } catch (err) {
+      if (err && err.representativeSql) {
+        err.sql = simulationSql(payload, err.representativeSql);
+      }
+      throw err;
+    }
   }
 
   async function cancelSimulation(runId) {

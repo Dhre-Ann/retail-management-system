@@ -3,18 +3,44 @@
 const pool = require('../db/pool');
 
 // Approved sale:
-//   { saved: true, receipt_id, subtotal, tax, total, payment_status: 'approved' }
+//   { saved: true, receipt_id, subtotal, tax, total, payment_status: 'approved', sql_statements }
 // Card declined for lack of funds:
-//   { saved: false, message: 'Insufficient funds' }
+//   { saved: false, message: 'Insufficient funds', sql_statements }
+// sql_statements is the SQL text sent on this call, in execution order.
+// Placeholders stay as $1, $2, ... The bound values are not copied into the trace.
 // Invalid input throws Error('Invalid checkout request') with statusCode 400.
 // A missing database connection throws statusCode 500.
 // An unknown bank account throws Error('Bank account not found') with statusCode 400.
 // Store, stock, product, and SQL failures throw Error with the same message as before.
+// Thrown errors also carry sql_statements for the statements already sent, including ROLLBACK.
 // The route turns thrown errors into the HTTP response.
 
 // The hundredths already accepted by the weight and quantity checks.
 function amountParam(amount) {
     return (Math.round(amount * 100) / 100).toFixed(2);
+}
+
+// Records the statement text actually passed to the pooled client.
+// The pooled client itself is left unchanged so a later checkout cannot
+// inherit this trace. Parameter values are not recorded.
+function traceClient(client) {
+    const statements = [];
+
+    return {
+        statements,
+        query(text, params) {
+            const source = typeof text === 'string'
+                ? text
+                : (text && typeof text.text === 'string' ? text.text : '');
+            const sql = source.trim();
+            if (sql) statements.push(sql);
+            if (arguments.length > 1) return client.query(text, params);
+            return client.query(text);
+        },
+        release() {
+            return client.release();
+        }
+    };
 }
 
 // One SELECT branch per line. PostgreSQL sums the rounded line totals,
@@ -75,6 +101,7 @@ async function processCheckout(payload) {
         (payment_method === 'cash' && account_id != null)) {
         const error = new Error('Invalid checkout request');
         error.statusCode = 400;
+        error.sql_statements = [];
         throw error;
     }
 
@@ -85,14 +112,17 @@ async function processCheckout(payload) {
     if (!client) {
         const error = new Error('Database connection failed');
         error.statusCode = 500;
+        error.sql_statements = [];
         throw error;
     }
 
+    const traced = traceClient(client);
+
     try {
-        await client.query('BEGIN');
+        await traced.query('BEGIN');
 
         // retrieving store and state tax
-        const storeResult = await client.query(`
+        const storeResult = await traced.query(`
             SELECT s.store_id, t.tax_rate
             FROM supermarkets.store s
             INNER JOIN supermarkets.statetax t ON s.state = t.state
@@ -121,7 +151,7 @@ async function processCheckout(payload) {
 
             seen.add(item.sku);
 
-            const result = await client.query(`
+            const result = await traced.query(`
                 SELECT p.sku, p.unit_price, p.tax_treatment,
                        p.sold_by_weight, i.available_quantity
                 FROM supermarkets.product p
@@ -154,7 +184,7 @@ async function processCheckout(payload) {
             }
 
             // price and line total come from PostgreSQL while the inventory lock is held
-            const priced = await client.query(`
+            const priced = await traced.query(`
                 SELECT p.unit_price,
                        p.tax_treatment,
                        ROUND(p.unit_price * $3::numeric, 2) AS line_total
@@ -186,7 +216,7 @@ async function processCheckout(payload) {
         }
         totalParams.push(store_id);
 
-        const totalsResult = await client.query(
+        const totalsResult = await traced.query(
             pricingTotalsSql(purchasedItems.length),
             totalParams
         );
@@ -202,7 +232,7 @@ async function processCheckout(payload) {
 
         // check and debit bank account for card payments
         if (payment_method === 'card') {
-            const debit = await client.query(`
+            const debit = await traced.query(`
                 UPDATE banking.bankaccount
                 SET account_balance = account_balance - $1
                 WHERE account_id = $2
@@ -211,13 +241,13 @@ async function processCheckout(payload) {
             `, [totalAmount, account_id]);
 
             if (!debit.rows.length) {
-                const account = await client.query(`
+                const account = await traced.query(`
                     SELECT account_id
                     FROM banking.bankaccount
                     WHERE account_id = $1
                 `, [account_id]);
 
-                await client.query('ROLLBACK');
+                await traced.query('ROLLBACK');
 
                 if (!account.rows.length) {
                     // already rolled back, so the catch below must not roll back again
@@ -229,15 +259,16 @@ async function processCheckout(payload) {
 
                 return {
                     saved: false,
-                    message: 'Insufficient funds'
+                    message: 'Insufficient funds',
+                    sql_statements: traced.statements.slice()
                 };
             }
         }
 
         // generating receipt ID and inserting receipt
-        await client.query('SELECT pg_advisory_xact_lock(3380, 1)');
+        await traced.query('SELECT pg_advisory_xact_lock(3380, 1)');
 
-        const receiptResult = await client.query(`
+        const receiptResult = await traced.query(`
             INSERT INTO supermarkets.receipt
                 (receipt_id, store_id, receipt_date, receipt_time,
                  subtotal, tax_amount, total_amount)
@@ -261,7 +292,7 @@ async function processCheckout(payload) {
         for (let i = 0; i < purchasedItems.length; i++) {
             const item = purchasedItems[i];
 
-            await client.query(`
+            await traced.query(`
                 INSERT INTO supermarkets.receiptitem
                     (receipt_id, receipt_line_number, sku,
                      quantity, weight, unit_price, line_total)
@@ -272,7 +303,7 @@ async function processCheckout(payload) {
                 item.unit_price, item.line_total
             ]);
 
-            await client.query(`
+            await traced.query(`
                 UPDATE supermarkets.inventory
                 SET available_quantity = available_quantity - $1
                 WHERE store_id = $2 AND sku = $3
@@ -280,9 +311,9 @@ async function processCheckout(payload) {
         }
 
         // recording the approved payment
-        await client.query('SELECT pg_advisory_xact_lock(3380, 2)');
+        await traced.query('SELECT pg_advisory_xact_lock(3380, 2)');
 
-        await client.query(`
+        await traced.query(`
             INSERT INTO supermarkets.payment
                 (payment_id, receipt_id, account_id, payment_method,
                  amount, payment_date, payment_time, payment_status)
@@ -299,7 +330,7 @@ async function processCheckout(payload) {
         ]);
 
         // committing the transaction
-        await client.query('COMMIT');
+        await traced.query('COMMIT');
 
         return {
             saved: true,
@@ -307,18 +338,20 @@ async function processCheckout(payload) {
             subtotal: Number(subtotal),
             tax: Number(taxAmount),
             total: Number(totalAmount),
-            payment_status: 'approved'
+            payment_status: 'approved',
+            sql_statements: traced.statements.slice()
         };
 
     } catch (error) {
         if (!error.rolledBack) {
-            await client.query('ROLLBACK').catch(() => {});
+            await traced.query('ROLLBACK').catch(() => {});
             console.error('Checkout error:', error.message);
         }
 
+        error.sql_statements = traced.statements.slice();
         throw error;
     } finally {
-        client.release();
+        traced.release();
     }
 }
 

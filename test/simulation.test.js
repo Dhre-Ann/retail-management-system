@@ -135,6 +135,18 @@ require.cache[checkoutPath] = {
       if (db.checkoutMode === 'throw') {
         throw new Error('Insufficient stock for SKU-0');
       }
+      if (db.checkoutMode === 'trace') {
+        if (db.traceFailFirst && n === 1) {
+          const error = new Error('Insufficient stock for SKU-0');
+          error.sql_statements = db.traceFailStatements.slice();
+          throw error;
+        }
+        const statements = db.traceStatements.slice();
+        if (db.traceDecline) {
+          return { saved: false, message: 'Insufficient funds', sql_statements: statements };
+        }
+        return { saved: true, receipt_id: n, total: 12.5, sql_statements: statements };
+      }
       return { saved: true, receipt_id: n, total: 12.5 };
     }
   }
@@ -213,6 +225,10 @@ beforeEach(() => {
   db.receipts = [];
   db.checkoutMode = 'approve';
   db.pending = [];
+  db.traceStatements = null;
+  db.traceFailFirst = false;
+  db.traceFailStatements = null;
+  db.traceDecline = false;
   readyDatabase();
 });
 
@@ -555,5 +571,88 @@ describe('recent receipts', () => {
     assert.equal(res.body.rows[0].store_name, 'FreshMart Houston #1');
     assert.equal(res.body.rows[0].total_amount, 10.83);
     assert.equal(res.body.rows[0].payment_status, 'approved');
+  });
+});
+
+describe('simulation SQL visibility', () => {
+  const approvedTrace = [
+    'BEGIN',
+    'SELECT p.sku FROM supermarkets.product p WHERE p.sku = $1 AND i.store_id = $2 FOR UPDATE OF i',
+    'SELECT ROUND(p.unit_price * $3::numeric, 2) AS line_total FROM supermarkets.product p WHERE p.sku = $1',
+    'UPDATE banking.bankaccount SET account_balance = account_balance - $1 WHERE account_id = $2',
+    'INSERT INTO supermarkets.receipt (receipt_id, store_id, subtotal) VALUES ($1, $2, $3)',
+    'INSERT INTO supermarkets.receiptitem (receipt_id, sku, line_total) VALUES ($1, $2, $3)',
+    'UPDATE supermarkets.inventory SET available_quantity = available_quantity - $1 WHERE store_id = $2 AND sku = $3',
+    'INSERT INTO supermarkets.payment (payment_id, account_id, amount) VALUES ($1, $2, $3)',
+    'COMMIT'
+  ];
+
+  test('returns one representative checkout trace and does not attach SQL to every transaction', async () => {
+    db.checkoutMode = 'trace';
+    db.traceStatements = approvedTrace;
+    const res = mockRes();
+    await simulate(requestBody({ transaction_count: 5, concurrency: 1, store_count: 1 }), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.transactions.length, 5);
+    assert.equal(res.body.summary.approved, 5);
+    assert.ok(res.body.transactions.every((tx) => tx.sql_statements == null));
+    assert.equal(res.body.representative_sql.label, 'Representative transaction trace');
+    assert.equal(res.body.representative_sql.transaction_number, 1);
+    assert.equal(res.body.representative_sql.outcome, 'approved');
+    assert.deepEqual(res.body.representative_sql.statements, approvedTrace);
+    assert.equal(JSON.stringify(res.body).split('BEGIN').length - 1, 1);
+    assert.doesNotMatch(res.body.representative_sql.statements.join('\n'), /account_number|password|postgres:\/\//i);
+  });
+
+  test('a run of declined checkouts still shows the statements through ROLLBACK', async () => {
+    db.checkoutMode = 'trace';
+    db.traceDecline = true;
+    db.traceStatements = [
+      'BEGIN',
+      'UPDATE banking.bankaccount SET account_balance = account_balance - $1 WHERE account_id = $2',
+      'SELECT account_id FROM banking.bankaccount WHERE account_id = $1',
+      'ROLLBACK'
+    ];
+    const res = mockRes();
+    await simulate(requestBody({ transaction_count: 3, concurrency: 1, store_count: 1 }), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.summary.declined, 3);
+    assert.equal(res.body.summary.approved, 0);
+    assert.equal(res.body.representative_sql.outcome, 'declined');
+    assert.equal(res.body.representative_sql.transaction_number, 1);
+    assert.equal(res.body.representative_sql.statements.at(-1), 'ROLLBACK');
+    assert.equal(res.body.representative_sql.statements.includes('COMMIT'), false);
+    assert.equal(JSON.stringify(res.body.transactions).includes('ROLLBACK'), false);
+  });
+
+  test('prefers one approved trace when an earlier checkout rolled back', async () => {
+    db.checkoutMode = 'trace';
+    db.traceFailFirst = true;
+    db.traceFailStatements = [
+      'BEGIN',
+      'SELECT p.sku FROM supermarkets.product p WHERE p.sku = $1',
+      'ROLLBACK'
+    ];
+    db.traceStatements = ['BEGIN', 'INSERT INTO supermarkets.receipt (receipt_id) VALUES ($1)', 'COMMIT'];
+    const res = mockRes();
+    await simulate(requestBody({ transaction_count: 2, concurrency: 1, store_count: 1 }), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.transactions[0].status, 'failed');
+    assert.equal(res.body.transactions[0].sql_statements, undefined);
+    assert.equal(res.body.transactions[1].status, 'approved');
+    assert.equal(res.body.representative_sql.transaction_number, 2);
+    assert.equal(res.body.representative_sql.outcome, 'approved');
+    assert.deepEqual(res.body.representative_sql.statements, db.traceStatements);
+  });
+
+  test('does not invent a trace when checkout did not capture SQL', async () => {
+    const res = mockRes();
+    await simulate(requestBody(), res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.representative_sql, undefined);
+    assert.equal(res.body.summary.approved, 1);
   });
 });

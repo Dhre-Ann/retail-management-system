@@ -399,6 +399,60 @@ function emptyResult(transactionNumber, elapsedMs, message, storeId) {
     };
 }
 
+function checkoutOutcome(result) {
+    if (result && result.saved === true) return 'approved';
+    if (result && result.saved === false) return 'declined';
+    return 'unexpected';
+}
+
+// Keeps one captured checkout trace for the SQL panel.
+// An approved checkout is preferred. Otherwise the earliest checkout that
+// sent SQL is kept. The statements are the text processCheckout recorded.
+function rememberRepresentative(bucket, transactionNumber, outcome, statements) {
+    if (!bucket || !Array.isArray(statements)) return;
+
+    const copy = statements
+        .filter((statement) => typeof statement === 'string' && statement.trim())
+        .map((statement) => statement.trim());
+
+    if (copy.length === 0) return;
+
+    const candidate = {
+        transaction_number: transactionNumber,
+        outcome,
+        statements: copy
+    };
+    const current = bucket.trace;
+
+    if (!current) {
+        bucket.trace = candidate;
+        return;
+    }
+
+    const currentApproved = current.outcome === 'approved';
+    const candidateApproved = outcome === 'approved';
+
+    if (candidateApproved && !currentApproved) {
+        bucket.trace = candidate;
+        return;
+    }
+
+    if (candidateApproved === currentApproved && transactionNumber < current.transaction_number) {
+        bucket.trace = candidate;
+    }
+}
+
+function publicRepresentative(trace) {
+    if (!trace) return null;
+
+    return {
+        label: 'Representative transaction trace',
+        transaction_number: trace.transaction_number,
+        outcome: trace.outcome,
+        statements: trace.statements
+    };
+}
+
 function checkoutResult(transactionNumber, payload, elapsedMs, result, error) {
     const base = {
         transaction_number: transactionNumber,
@@ -445,7 +499,7 @@ function checkoutResult(transactionNumber, payload, elapsedMs, result, error) {
     };
 }
 
-async function executePurchase(transactionNumber, stores, accountIds, storeId) {
+async function executePurchase(transactionNumber, stores, accountIds, storeId, traceBucket) {
     const plannedAt = performance.now();
     const payload = buildPurchase(stores, accountIds, storeId);
 
@@ -463,6 +517,12 @@ async function executePurchase(transactionNumber, stores, accountIds, storeId) {
 
     try {
         const result = await processCheckout(payload);
+        rememberRepresentative(
+            traceBucket,
+            transactionNumber,
+            checkoutOutcome(result),
+            result && result.sql_statements
+        );
         return checkoutResult(
             transactionNumber,
             payload,
@@ -471,6 +531,12 @@ async function executePurchase(transactionNumber, stores, accountIds, storeId) {
             null
         );
     } catch (error) {
+        rememberRepresentative(
+            traceBucket,
+            transactionNumber,
+            'failed',
+            error && error.sql_statements
+        );
         return checkoutResult(
             transactionNumber,
             payload,
@@ -497,7 +563,7 @@ function cancelledResult(transactionNumber, storeId) {
 
 // each worker finishes one checkout before taking another index.
 // After Stop, no worker takes a new index; checkouts already started finish normally.
-async function runTransactions(transactionCount, concurrency, stores, accountIds, assignments, run) {
+async function runTransactions(transactionCount, concurrency, stores, accountIds, assignments, run, traceBucket) {
     const results = new Array(transactionCount);
     let nextIndex = 0;
 
@@ -512,7 +578,8 @@ async function runTransactions(transactionCount, concurrency, stores, accountIds
                     index + 1,
                     stores,
                     accountIds,
-                    assignments[index]
+                    assignments[index],
+                    traceBucket
                 );
             } catch (error) {
                 results[index] = emptyResult(
@@ -780,6 +847,7 @@ async function runSimulation(parsed, runId, run, res) {
     }
 
     const started = performance.now();
+    const traceBucket = { trace: null };
 
     try {
         const catalog = await loadCatalog();
@@ -802,10 +870,11 @@ async function runSimulation(parsed, runId, run, res) {
             catalog.stores,
             catalog.accountIds,
             assignments,
-            run
+            run,
+            traceBucket
         );
 
-        res.json({
+        const body = {
             run_id: runId,
             summary: summarize(
                 parsed.transactionCount,
@@ -814,13 +883,19 @@ async function runSimulation(parsed, runId, run, res) {
                 run.cancelled
             ),
             transactions
-        });
+        };
+        const representative = publicRepresentative(traceBucket.trace);
+        if (representative) body.representative_sql = representative;
+        res.json(body);
     } catch (error) {
         console.error('Simulation error:', error.message);
-        res.status(500).json({
+        const body = {
             status: 'error',
             message: 'Unable to run simulation'
-        });
+        };
+        const representative = publicRepresentative(traceBucket.trace);
+        if (representative) body.representative_sql = representative;
+        res.status(500).json(body);
     }
 }
 
