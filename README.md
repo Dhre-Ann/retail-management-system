@@ -59,11 +59,3 @@ The database uses two PostgreSQL schemas: `supermarkets` (stores, products, inve
 - [`sql/transaction.sql`](sql/transaction.sql): Checkout transaction reference
 - [Final ER diagram](docs/ERD/ERD_final.png) and [Phase 1 documentation](docs/Group_16_documentation_phase_1.pdf)
 
-## Team Contributions
-
-*Replace these placeholders with each member's actual work before submitting.*
-
-- **[Member name]:** [Contributions]
-- **[Member name]:** [Contributions]
-- **[Member name]:** [Contributions]
-- **[Member name]:** [Contributions]
