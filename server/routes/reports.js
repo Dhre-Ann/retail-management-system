@@ -9,11 +9,22 @@ const router = express.Router();
 router.get('/reports/sales-by-store', async (req, res) => {
     try {
         const { start_date, end_date } = req.query;
+        const timeZone = typeof req.query.time_zone === 'string' && req.query.time_zone.trim()
+            ? req.query.time_zone.trim()
+            : Intl.DateTimeFormat().resolvedOptions().timeZone;
 
         if (!start_date || !end_date) {
             return res.status(400).json({
                 status: 'error',
                 message: 'Start date and end date are required'
+            });
+        }
+
+        // Date inputs are local calendar days. Receipt clock values use the database time zone.
+        if (!/^[A-Za-z0-9_+\-/]+$/.test(timeZone)) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Time zone is invalid'
             });
         }
 
@@ -28,10 +39,13 @@ router.get('/reports/sales-by-store', async (req, res) => {
             FROM supermarkets.store s
             LEFT JOIN supermarkets.receipt r
                 ON r.store_id = s.store_id
-                AND r.receipt_date BETWEEN $1 AND $2
+                AND ((r.receipt_date + r.receipt_time) AT TIME ZONE current_setting('TIMEZONE'))
+                    >= ($1::timestamp AT TIME ZONE $3)
+                AND ((r.receipt_date + r.receipt_time) AT TIME ZONE current_setting('TIMEZONE'))
+                    < (($2::date + INTERVAL '1 day') AT TIME ZONE $3)
             GROUP BY s.store_id, s.store_name, s.city, s.state
             ORDER BY total_sales DESC
-        `, [start_date, end_date]);
+        `, [start_date, end_date, timeZone]);
 
         res.json(result.rows);
 

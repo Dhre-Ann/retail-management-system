@@ -397,7 +397,10 @@ const API = (function () {
     'FROM supermarkets.store s',
     'LEFT JOIN supermarkets.receipt r',
     '    ON r.store_id = s.store_id',
-    '    AND r.receipt_date BETWEEN $1 AND $2',
+    '    AND ((r.receipt_date + r.receipt_time) AT TIME ZONE current_setting(\'TIMEZONE\'))',
+    '        >= ($1::timestamp AT TIME ZONE $3)',
+    '    AND ((r.receipt_date + r.receipt_time) AT TIME ZONE current_setting(\'TIMEZONE\'))',
+    '        < (($2::date + INTERVAL \'1 day\') AT TIME ZONE $3)',
     'GROUP BY s.store_id, s.store_name, s.city, s.state',
     'ORDER BY total_sales DESC;'
   ].join('\n');
@@ -481,6 +484,16 @@ const API = (function () {
     return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
   }
 
+  function reportTimeZone() {
+    try {
+      const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (typeof zone === 'string' && /^[A-Za-z0-9_+\-/]+$/.test(zone)) return zone;
+    } catch (err) {
+      // Date inputs are still local calendar days if the zone name is unavailable.
+    }
+    return 'UTC';
+  }
+
   function reportTable(title, columns, rows, emptyMessage, sql, ms) {
     return {
       data: {
@@ -497,11 +510,13 @@ const API = (function () {
   async function salesByStore(params) {
     const start = params && params.start_date;
     const end = params && params.end_date;
+    const zone = reportTimeZone();
     const sql = [
-      `GET /api/reports/sales-by-store?start_date=${isoDate(start) ? start : ''}&end_date=${isoDate(end) ? end : ''}`,
+      `GET /api/reports/sales-by-store?start_date=${isoDate(start) ? start : ''}&end_date=${isoDate(end) ? end : ''}&time_zone=${zone}`,
       SALES_BY_STORE_SQL,
       `-- $1 = ${isoDate(start) ? start : 'invalid'}`,
-      `-- $2 = ${isoDate(end) ? end : 'invalid'}`
+      `-- $2 = ${isoDate(end) ? end : 'invalid'}`,
+      `-- $3 = ${zone}`
     ].join('\n');
     if (!isoDate(start) || !isoDate(end)) {
       throw fail('Sales by store failed: choose both a start date and an end date.', sql, 0);
@@ -509,7 +524,7 @@ const API = (function () {
     if (start > end) {
       throw fail('Sales by store failed: the start date is after the end date.', sql, 0);
     }
-    const path = `/api/reports/sales-by-store?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}`;
+    const path = `/api/reports/sales-by-store?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}&time_zone=${encodeURIComponent(zone)}`;
     const { body, ms } = await request('GET', path, sql);
     const rows = expectArray(body, 'Sales by store', sql, ms);
     return reportTable(

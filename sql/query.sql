@@ -1,4 +1,6 @@
 -- Q1. Sales per store (Store JOIN Receipt)
+-- $1 and $2 are local calendar dates. $3 is the IANA time zone of those dates.
+-- Receipt date and time are stored in the database time zone. The end date includes that whole local day.
 SELECT
     s.store_id,
     s.store_name,
@@ -9,7 +11,10 @@ SELECT
 FROM supermarkets.store s
 LEFT JOIN supermarkets.receipt r
     ON r.store_id = s.store_id
-    AND r.receipt_date BETWEEN $1 AND $2
+    AND ((r.receipt_date + r.receipt_time) AT TIME ZONE current_setting('TIMEZONE'))
+        >= ($1::timestamp AT TIME ZONE $3)
+    AND ((r.receipt_date + r.receipt_time) AT TIME ZONE current_setting('TIMEZONE'))
+        < (($2::date + INTERVAL '1 day') AT TIME ZONE $3)
 GROUP BY s.store_id, s.store_name, s.city, s.state
 ORDER BY total_sales DESC;
 
